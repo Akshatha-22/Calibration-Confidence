@@ -19,7 +19,7 @@ We compare **five architectures** on the same financial time series data:
 
 | Model | Type | Why It's Included |
 |-------|------|-------------------|
-| **MLP** (Sliding Window) | Feedforward | Baseline with no temporal memory |
+| **MLP** | (Sliding Window) | Feedforward | Baseline with no temporal memory |
 | **Deep MLP** | Feedforward | Tests if depth affects calibration |
 | **Vanilla RNN** | Recurrent | Simple recurrent baseline, clear gradient dynamics |
 | **LSTM** | Gated Recurrent | Industry standard, masks gradient issues |

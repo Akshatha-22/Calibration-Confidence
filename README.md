@@ -1,4 +1,4 @@
-# AI-Calibration-
+# Calibration-Failure-Detection
 This is an 8th semester project.
 # 📊 AI Confidence Calibration Failure Detection in Financial Time Series
 

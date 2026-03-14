@@ -149,3 +149,41 @@ Our academic advisors and reviewers
 ⭐ Star History
 If you find this project useful, please consider giving it a star! It helps others discover our work.
 
+# Project Coding Standards
+
+## 1. Python Version
+- Use Python 3.11+
+
+## 2. Naming
+- Variables: snake_case (e.g., `hidden_size`)
+- Functions: snake_case (e.g., `train_model()`)
+- Classes: PascalCase (e.g., `VanillaRNN`)
+- Constants: UPPER_CASE (e.g., `MAX_EPOCHS = 100`)
+
+## 3. Imports (in this order)
+1. Standard library (os, sys, json)
+2. Third-party (torch, numpy, matplotlib)
+3. Local modules (models.rnn, calibration.ece)
+
+## 4. Line Length
+- Maximum 88 characters (Black default)
+
+## 5. Docstrings
+- Every function needs a docstring explaining:
+  - What it does
+  - Parameters
+  - Returns
+
+## 6. Comments
+- Explain WHY, not WHAT (the code shows what)
+- No commented-out code
+
+## 7. Git Commits
+- Use present tense: "Add ECE computation" not "Added ECE computation"
+- First line <50 chars, then blank line, then details
+
+## 8. Tools We Use
+- Formatting: Black
+- Linting: Flake8
+- Type checking: mypy (optional)
+

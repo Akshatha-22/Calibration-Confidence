@@ -50,5 +50,36 @@ def expected_calibration_error(probs: np.ndarray, labels: np.ndarray, n_bins: in
     return ece
 
 
+def regression_calibration_error(
+    preds: np.ndarray, targets: np.ndarray, n_bins: int = 10
+) -> float:
+    """Regression calibration: bin by predicted value, then |mean_pred - mean_target| per bin.
+
+    Lower is better (predictions match targets within bins).
+    """
+    preds = np.asarray(preds).reshape(-1)
+    targets = np.asarray(targets).reshape(-1)
+    if preds.shape[0] != targets.shape[0]:
+        raise ValueError("preds and targets must have the same number of samples")
+    if preds.shape[0] == 0:
+        return float("nan")
+    lo, hi = float(np.min(preds)), float(np.max(preds))
+    if hi <= lo:
+        return 0.0
+    bin_edges = np.linspace(lo, hi, n_bins + 1)
+    err = 0.0
+    for i in range(n_bins):
+        mask = (preds >= bin_edges[i]) & (preds < bin_edges[i + 1])
+        if i == n_bins - 1:
+            mask = (preds >= bin_edges[i]) & (preds <= bin_edges[i + 1])
+        if not np.any(mask):
+            continue
+        n = np.sum(mask)
+        mean_pred = np.mean(preds[mask])
+        mean_tgt = np.mean(targets[mask])
+        err += (n / len(preds)) * abs(mean_pred - mean_tgt)
+    return float(err)
+
+
 # Alias for convenience
 ece = expected_calibration_error

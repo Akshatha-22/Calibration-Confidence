@@ -25,6 +25,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
+import numpy as np
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -48,6 +49,7 @@ from models.deep_mlp import build_deep_mlp
 from models.vanilla_rnn import build_vanilla_rnn
 from models.lstm import build_lstm
 from models.residual_mlp import build_residual_mlp
+from calibration.ece import expected_calibration_error, regression_calibration_error
 
 
 def split_dataset(dataset: FinSenDataset, val_ratio: float = 0.2) -> Tuple[Subset, Subset]:
@@ -105,18 +107,122 @@ def eval_epoch(
     loader: DataLoader,
     loss_fn: nn.Module,
     device: torch.device,
-) -> float:
+    n_bins: int = 10,
+) -> Tuple[float, float]:
+    """Returns (mean_val_loss, regression_calibration_error)."""
     model.eval()
     total_loss = 0.0
+    all_preds: List[torch.Tensor] = []
+    all_targets: List[torch.Tensor] = []
 
     with torch.no_grad():
         for x, y in loader:
             x, y = x.to(device), y.to(device)
             preds = model(x)
             loss = loss_fn(preds, y)
-            total_loss += loss.item() * x.size(0)
+            if torch.isfinite(loss).all():
+                total_loss += loss.item() * x.size(0)
+            all_preds.append(preds.cpu().numpy())
+            all_targets.append(y.cpu().numpy())
 
-    return total_loss / len(loader.dataset)
+    n = len(loader.dataset)
+    val_loss = total_loss / max(n, 1)
+    preds_arr = np.concatenate(all_preds, axis=0)
+    targets_arr = np.concatenate(all_targets, axis=0)
+    reg_ece = regression_calibration_error(preds_arr, targets_arr, n_bins=n_bins)
+    return val_loss, float(reg_ece)
+
+
+def collect_results(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    save_path: str | None = None,
+    history: Dict[str, List[float]] | None = None,
+) -> Dict[str, np.ndarray]:
+    """Run model on a dataloader and collect predictions/targets.
+
+    For classification-style outputs (logits with shape (N, C), C > 1),
+    this also computes probabilities, confidences, predicted labels,
+    and ECE values. Optionally merges in history (losses, ECE over time).
+    """
+    model.eval()
+
+    all_preds: List[np.ndarray] = []
+    all_targets: List[np.ndarray] = []
+
+    with torch.no_grad():
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            preds = model(x)
+            all_preds.append(preds.detach().cpu().numpy())
+            all_targets.append(y.detach().cpu().numpy())
+
+    preds_arr = np.concatenate(all_preds, axis=0)
+    targets_arr = np.concatenate(all_targets, axis=0)
+
+    # Align shapes: flatten to (N,) or keep (N, F) for per-example loss
+    if preds_arr.ndim > 1 and preds_arr.shape[-1] == 1:
+        preds_flat = np.squeeze(preds_arr)
+    else:
+        preds_flat = preds_arr
+    if targets_arr.ndim > 1 and targets_arr.shape[-1] == 1:
+        targets_flat = np.squeeze(targets_arr)
+    else:
+        targets_flat = targets_arr
+    if preds_flat.ndim == 1:
+        preds_flat = preds_flat.reshape(-1, 1)
+    if targets_flat.ndim == 1:
+        targets_flat = targets_flat.reshape(-1, 1)
+    # Ensure same shape for elementwise loss
+    if preds_flat.shape != targets_flat.shape:
+        preds_flat = preds_arr.reshape(preds_arr.shape[0], -1)
+        targets_flat = targets_arr.reshape(targets_arr.shape[0], -1)
+    per_example_sq = (preds_flat - targets_flat) ** 2
+    per_example_loss = np.mean(per_example_sq, axis=-1)
+    if not np.isfinite(per_example_loss).all():
+        per_example_loss = np.nan_to_num(per_example_loss, nan=0.0, posinf=0.0, neginf=0.0)
+
+    results: Dict[str, np.ndarray] = {
+        "predictions": preds_arr,
+        "targets": targets_arr,
+        "per_example_loss": per_example_loss,
+    }
+
+    # If outputs look like multi-class logits, compute calibration stats.
+    if preds_arr.ndim == 2 and preds_arr.shape[1] > 1:
+        logits = preds_arr
+        logits_max = np.max(logits, axis=1, keepdims=True)
+        exp_logits = np.exp(np.clip(logits - logits_max, -50, 50))
+        probs = exp_logits / np.sum(exp_logits, axis=1, keepdims=True)
+        confidences = np.max(probs, axis=1)
+        pred_labels = np.argmax(probs, axis=1)
+        results["probs"] = probs
+        results["confidences"] = confidences
+        results["pred_labels"] = pred_labels
+        if targets_arr.ndim == 1 or (targets_arr.ndim == 2 and targets_arr.shape[1] == 1):
+            labels = targets_arr.reshape(-1).astype(int)
+            ece_val = expected_calibration_error(probs, labels, n_bins=10)
+            results["ece"] = np.asarray([ece_val], dtype=np.float32)
+
+    if history:
+        n_epochs = len(history["train_loss"])
+        results["epochs"] = np.arange(1, n_epochs + 1, dtype=np.int32)
+        results["train_loss"] = np.asarray(history["train_loss"], dtype=np.float32)
+        results["val_loss"] = np.asarray(history["val_loss"], dtype=np.float32)
+        ece_list = history.get("ece", [])
+        if len(ece_list) == n_epochs:
+            results["ece_over_time"] = np.asarray(ece_list, dtype=np.float32)
+        if history.get("train_grad_norm"):
+            results["train_grad_norm"] = np.asarray(history["train_grad_norm"], dtype=np.float32)
+
+    if save_path is not None:
+        dirpath = os.path.dirname(save_path)
+        if dirpath:
+            os.makedirs(dirpath, exist_ok=True)
+        np.savez_compressed(save_path, **results)
+
+    return results
 
 
 def train_model(
@@ -135,6 +241,7 @@ def train_model(
     log_dir: str = "results/logs",
     wandb_project: str | None = None,
     wandb_run_name: str | None = None,
+    results_path: str | None = None,
 ) -> Tuple[nn.Module, Dict[str, List[float]]]:
     """Unified training loop for all supported models.
 
@@ -204,6 +311,7 @@ def train_model(
         "train_loss": [],
         "val_loss": [],
         "train_grad_norm": [],
+        "ece": [],
     }
 
     # Logging backends -----------------------------------------------------
@@ -249,21 +357,26 @@ def train_model(
 
     if checkpoint_path is not None and resume and os.path.exists(checkpoint_path):
         print(f"Loading checkpoint from {checkpoint_path}")
-        ckpt = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(ckpt["model_state_dict"])
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        history = ckpt.get("history", history)
-        start_epoch = ckpt.get("epoch", 0) + 1
-        best_val_loss = ckpt.get("best_val_loss", best_val_loss)
-        print(f"Resuming from epoch {start_epoch} (best_val_loss={best_val_loss:.6f})")
+        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        ckpt_model = ckpt.get("model_name")
+        if ckpt_model == model_name:
+            model.load_state_dict(ckpt["model_state_dict"])
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            history = ckpt.get("history", history)
+            start_epoch = ckpt.get("epoch", 0) + 1
+            best_val_loss = ckpt.get("best_val_loss", best_val_loss)
+            print(f"Resuming from epoch {start_epoch} (best_val_loss={best_val_loss:.6f})")
+        else:
+            print(f"Checkpoint is for model '{ckpt_model}', current is '{model_name}'; starting fresh.")
 
     for epoch in range(start_epoch, epochs + 1):
         train_loss, train_grad_norm = train_epoch(model, train_loader, loss_fn, optimizer, device)
-        val_loss = eval_epoch(model, val_loader, loss_fn, device)
+        val_loss, reg_ece = eval_epoch(model, val_loader, loss_fn, device)
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
         history["train_grad_norm"].append(train_grad_norm)
-        print(f"Epoch {epoch:3d} | train_loss={train_loss:.6f} | val_loss={val_loss:.6f}")
+        history["ece"].append(reg_ece)
+        print(f"Epoch {epoch:3d} | train_loss={train_loss:.6f} | val_loss={val_loss:.6f} | ECE={reg_ece:.4f}")
 
         # Scalar logging ---------------------------------------------------
         if writer is not None:
@@ -286,10 +399,13 @@ def train_model(
             best_val_loss = val_loss
             epochs_without_improvement = 0
             if checkpoint_path is not None:
-                os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+                dirpath = os.path.dirname(checkpoint_path)
+                if dirpath:
+                    os.makedirs(dirpath, exist_ok=True)
                 torch.save(
                     {
                         "epoch": epoch,
+                        "model_name": model_name,
                         "model_state_dict": model.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
                         "history": history,
@@ -313,6 +429,11 @@ def train_model(
     if use_wandb:
         wandb.finish()
 
+    # Optionally collect detailed results on the validation set for analysis.
+    if results_path is not None:
+        print(f"Collecting detailed results on validation set to {results_path}")
+        collect_results(model, val_loader, device, save_path=results_path, history=history)
+
     return model, history
 
 
@@ -332,6 +453,7 @@ def main() -> None:
     parser.add_argument("--log-dir", type=str, default="results/logs", help="Base directory for TensorBoard logs")
     parser.add_argument("--wandb-project", type=str, default=None, help="Weights & Biases project name")
     parser.add_argument("--wandb-run-name", type=str, default=None, help="Weights & Biases run name")
+    parser.add_argument("--results-path", type=str, default="results/first_results.npz", help="Path to save detailed predictions/confidences/ECE")
     args = parser.parse_args()
 
     # Call the unified training loop. We ignore the returned objects here,
@@ -352,6 +474,7 @@ def main() -> None:
         log_dir=args.log_dir,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,
+        results_path=args.results_path,
     )
 
 

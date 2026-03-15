@@ -9,36 +9,58 @@ import os
 
 class FinSenDataset(Dataset):
     def __init__(self, data_path='data/finsen/raw', seq_length=50):
-        """
-        Load and merge multiple FinSen CSV files
-        
-        Args:
-            data_path: Path to folder containing CSV files
-            seq_length: Sequence length for models
+        """Load and merge FinSen CSV files into a sequence dataset.
+
+        The dataset expects numeric features to be present (for regression).
+        If the provided `data_path` has only text columns, it will attempt to fall
+        back to a sibling `processed` folder containing numeric features.
         """
         self.seq_length = seq_length
-        
-        # Load all CSV files from the raw folder
+
+        self.data = self._load_and_merge_csvs(data_path)
+        print(f"Merged data: {self.data.shape[0]} rows, {self.data.shape[1]} columns")
+
+        # Keep only numeric columns for model input.
+        # Non-numeric columns like categorical labels or text cannot be converted directly.
+        numeric_df = self.data.select_dtypes(include=[np.number])
+        if numeric_df.shape[1] == 0:
+            # Try to fall back to processed data if available
+            if os.path.basename(os.path.normpath(data_path)) == 'raw':
+                processed_path = os.path.join(os.path.dirname(data_path), 'processed')
+                if os.path.isdir(processed_path):
+                    print(f"No numeric columns found in raw CSVs; trying processed folder: {processed_path}")
+                    self.data = self._load_and_merge_csvs(processed_path)
+                    numeric_df = self.data.select_dtypes(include=[np.number])
+
+        if numeric_df.shape[1] == 0:
+            raise ValueError(
+                "No numeric columns found in the merged dataset. "
+                "Ensure the CSV files contain numeric features suitable for modeling."
+            )
+
+        self.values = numeric_df.values.astype(np.float32)
+        if numeric_df.shape[1] != self.data.shape[1]:
+            dropped = set(self.data.columns) - set(numeric_df.columns)
+            print(f"Dropped non-numeric columns: {sorted(dropped)}")
+
+    def _load_and_merge_csvs(self, data_path: str) -> pd.DataFrame:
+        """Load all CSV files in a folder and merge them (on 'date' if present)."""
         all_files = [f for f in os.listdir(data_path) if f.endswith('.csv')]
-        
+
         if len(all_files) == 0:
             raise FileNotFoundError(f"No CSV files found in {data_path}")
-        
+
         print(f"Found {len(all_files)} CSV files: {all_files}")
-        
-        # Load and merge all CSV files
+
         data_frames = []
         for file in all_files:
             file_path = os.path.join(data_path, file)
             df = pd.read_csv(file_path)
             print(f"Loaded {file}: {df.shape[0]} rows, {df.shape[1]} columns")
             data_frames.append(df)
-        
-        # Merge based on date column (assuming all have 'date')
+
         if len(data_frames) > 1:
-            # Start with first file
             merged_df = data_frames[0]
-            # Merge with others on date
             for df in data_frames[1:]:
                 if 'date' in df.columns:
                     merged_df = pd.merge(merged_df, df, on='date', how='outer')
@@ -46,20 +68,12 @@ class FinSenDataset(Dataset):
                     print(f"Warning: {file} has no 'date' column")
         else:
             merged_df = data_frames[0]
-        
-        # Sort by date and reset index
+
         if 'date' in merged_df.columns:
-            merged_df['date'] = pd.to_datetime(merged_df['date'])
+            merged_df['date'] = pd.to_datetime(merged_df['date'], errors='coerce')
             merged_df = merged_df.sort_values('date').reset_index(drop=True)
-        
-        self.data = merged_df
-        print(f"Merged data: {self.data.shape[0]} rows, {self.data.shape[1]} columns")
-        
-        # Convert to numpy for faster access (exclude date column if present)
-        if 'date' in self.data.columns:
-            self.values = self.data.drop('date', axis=1).values.astype(np.float32)
-        else:
-            self.values = self.data.values.astype(np.float32)
+
+        return merged_df
         
     def __len__(self):
         return len(self.values) - self.seq_length

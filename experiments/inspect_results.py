@@ -24,4 +24,13 @@ if "reliability" in data:
     print("Reliability:", data["reliability"])
 if "gradient_norms" in data:
     print(f"Gradient norms shape: {data['gradient_norms'].shape}")
+if "learning_rate" in data:
+    lrs = data["learning_rate"]
+    print(f"Learning rate history shape: {lrs.shape}, last={float(lrs[-1]):.6f}")
+if "train_accuracy" in data and "val_accuracy" in data:
+    print(
+        "Accuracy history:",
+        f"train={float(data['train_accuracy'][-1]):.4f}",
+        f"val={float(data['val_accuracy'][-1]):.4f}",
+    )
 

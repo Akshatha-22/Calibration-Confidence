@@ -38,6 +38,9 @@ def load_history(npz_path: str) -> dict:
     for key in ("train_loss", "val_loss", "ece_over_time", "train_grad_norm"):
         if key in data:
             out[key] = np.asarray(data[key]).ravel()
+    for key in ("learning_rate", "train_accuracy", "val_accuracy"):
+        if key in data:
+            out[key] = np.asarray(data[key]).ravel()
     return out
 
 
@@ -46,13 +49,34 @@ def plot_ece_over_time(
     labels: list[str] | None = None,
     save_path: str | None = None,
 ) -> None:
-    """Plot val_loss and ECE over epochs for one or more result files."""
+    """Plot loss, ECE, (optional) accuracy, and (optional) LR over epochs."""
     if labels is None:
         labels = [os.path.splitext(os.path.basename(p))[0] for p in npz_paths]
     if len(labels) != len(npz_paths):
         labels = [f"run_{i}" for i in range(len(npz_paths))]
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
+    histories: list[dict] = []
+    for npz_path in npz_paths:
+        if not os.path.isfile(npz_path):
+            continue
+        hist = load_history(npz_path)
+        histories.append(hist or {})
+
+    plot_accuracy = any(
+        hist.get("train_accuracy") is not None and hist.get("val_accuracy") is not None
+        for hist in histories
+    )
+    plot_lr = any("learning_rate" in hist for hist in histories)
+
+    rows = 2 + int(plot_accuracy) + int(plot_lr)
+    fig, axes = plt.subplots(rows, 1, figsize=(8, 3 * rows), sharex=True)
+    if isinstance(axes, plt.Axes):
+        axes = [axes]
+    else:
+        axes = list(np.atleast_1d(axes))
+    loss_ax, ece_ax = axes[0], axes[1]
+    acc_ax = axes[2] if plot_accuracy else None
+    lr_ax = axes[2 + int(plot_accuracy)] if plot_lr else None
 
     for npz_path, label in zip(npz_paths, labels):
         if not os.path.isfile(npz_path):
@@ -64,21 +88,38 @@ def plot_ece_over_time(
             continue
         epochs = hist["epochs"]
         if "val_loss" in hist:
-            ax1.plot(epochs, hist["val_loss"], label=label, marker="o", markersize=3)
+            loss_ax.plot(epochs, hist["val_loss"], label=label, marker="o", markersize=3)
         if "ece_over_time" in hist:
-            ax2.plot(epochs, hist["ece_over_time"], label=label, marker="s", markersize=3)
+            ece_ax.plot(epochs, hist["ece_over_time"], label=label, marker="s", markersize=3)
+        if plot_accuracy and acc_ax is not None:
+            if "train_accuracy" in hist and "val_accuracy" in hist:
+                acc_ax.plot(epochs, hist["train_accuracy"], label=f"{label} train", linestyle="--", markersize=3)
+                acc_ax.plot(epochs, hist["val_accuracy"], label=f"{label} val", linestyle="-", markersize=3)
+        if plot_lr and lr_ax is not None and "learning_rate" in hist:
+            lr_ax.plot(epochs, hist["learning_rate"], label=label, marker="^", markersize=3)
 
-    ax1.set_ylabel("Loss")
-    ax1.set_title("Loss over time")
-    ax1.legend(loc="best", fontsize=8)
-    ax1.grid(True, alpha=0.3)
+    loss_ax.set_ylabel("Loss")
+    loss_ax.set_title("Validation loss over time")
+    loss_ax.legend(loc="best", fontsize=8)
+    loss_ax.grid(True, alpha=0.3)
 
-    ax2.set_xlabel("Epoch")
-    ax2.set_ylabel("ECE (regression calibration error)")
-    ax2.set_title("ECE over time (lower = better calibrated)")
-    ax2.legend(loc="best", fontsize=8)
-    ax2.grid(True, alpha=0.3)
+    ece_ax.set_ylabel("ECE")
+    ece_ax.set_title("ECE over time (lower = better calibrated)")
+    ece_ax.legend(loc="best", fontsize=8)
+    ece_ax.grid(True, alpha=0.3)
 
+    if acc_ax is not None:
+        acc_ax.set_ylabel("Accuracy")
+        acc_ax.set_title("Accuracy over time")
+        acc_ax.legend(loc="best", fontsize=8)
+        acc_ax.grid(True, alpha=0.3)
+    if lr_ax is not None:
+        lr_ax.set_ylabel("Learning rate")
+        lr_ax.set_title("Learning rate schedule")
+        lr_ax.legend(loc="best", fontsize=8)
+        lr_ax.grid(True, alpha=0.3)
+
+    axes[-1].set_xlabel("Epoch")
     plt.tight_layout()
     if save_path:
         os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)

@@ -63,17 +63,60 @@ def split_dataset(dataset: FinSenDataset, val_ratio: float = 0.2) -> Tuple[Subse
     return Subset(dataset, train_idx), Subset(dataset, val_idx)
 
 
+def _classification_accuracy_counts(
+    preds: torch.Tensor, targets: torch.Tensor
+) -> Tuple[int, int] | None:
+    """Return (correct, total) when predictions/targets define a classification task."""
+    if preds.ndim == 0 or targets.ndim == 0:
+        return None
+
+    if targets.ndim > 1 and targets.shape[-1] == 1:
+        targets = targets.squeeze(-1)
+    if preds.ndim > 1 and preds.shape[-1] == 1:
+        preds = preds.squeeze(-1)
+
+    if targets.ndim != 1:
+        return None
+
+    if preds.ndim > 1 and preds.shape[-1] > 1:
+        pred_labels = preds.argmax(dim=-1).reshape(-1)
+    elif preds.ndim == 1:
+        pred_labels = preds.reshape(-1)
+    else:
+        return None
+
+    if pred_labels.shape != targets.shape:
+        return None
+
+    if targets.dtype in (torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8):
+        target_labels = targets
+    elif targets.dtype.is_floating_point:
+        if not torch.allclose(targets, targets.round(), atol=1e-4, rtol=1e-4):
+            return None
+        target_labels = targets.round()
+    else:
+        return None
+
+    target_labels = target_labels.long()
+    pred_labels = pred_labels.long()
+    total = target_labels.numel()
+    correct = int((pred_labels == target_labels).sum().item())
+    return correct, total
+
+
 def train_epoch(
     model: nn.Module,
     loader: DataLoader,
     loss_fn: nn.Module,
     optimizer: optim.Optimizer,
     device: torch.device,
-) -> Tuple[float, float]:
+) -> Tuple[float, float, float | None]:
     model.train()
     total_loss = 0.0
     total_grad_norm = 0.0
     num_batches = 0
+    correct = 0
+    accuracy_samples = 0
 
     for x, y in loader:
         x, y = x.to(device), y.to(device)
@@ -97,9 +140,15 @@ def train_epoch(
         total_grad_norm += batch_grad_norm
         num_batches += 1
 
-    mean_grad_norm = total_grad_norm / max(num_batches, 1)
+        acc_counts = _classification_accuracy_counts(preds, y)
+        if acc_counts is not None:
+            correct += acc_counts[0]
+            accuracy_samples += acc_counts[1]
 
-    return total_loss / len(loader.dataset), mean_grad_norm
+    mean_grad_norm = total_grad_norm / max(num_batches, 1)
+    accuracy = correct / accuracy_samples if accuracy_samples > 0 else None
+
+    return total_loss / len(loader.dataset), mean_grad_norm, accuracy
 
 
 def eval_epoch(
@@ -108,12 +157,14 @@ def eval_epoch(
     loss_fn: nn.Module,
     device: torch.device,
     n_bins: int = 10,
-) -> Tuple[float, float]:
-    """Returns (mean_val_loss, regression_calibration_error)."""
+) -> Tuple[float, float, float | None]:
+    """Returns (mean_val_loss, regression_calibration_error, accuracy)."""
     model.eval()
     total_loss = 0.0
     all_preds: List[torch.Tensor] = []
     all_targets: List[torch.Tensor] = []
+    correct = 0
+    accuracy_samples = 0
 
     with torch.no_grad():
         for x, y in loader:
@@ -125,12 +176,18 @@ def eval_epoch(
             all_preds.append(preds.cpu().numpy())
             all_targets.append(y.cpu().numpy())
 
+            acc_counts = _classification_accuracy_counts(preds, y)
+            if acc_counts is not None:
+                correct += acc_counts[0]
+                accuracy_samples += acc_counts[1]
+
     n = len(loader.dataset)
     val_loss = total_loss / max(n, 1)
     preds_arr = np.concatenate(all_preds, axis=0)
     targets_arr = np.concatenate(all_targets, axis=0)
     reg_ece = regression_calibration_error(preds_arr, targets_arr, n_bins=n_bins)
-    return val_loss, float(reg_ece)
+    accuracy = correct / accuracy_samples if accuracy_samples > 0 else None
+    return val_loss, float(reg_ece), accuracy
 
 
 def collect_results(
@@ -215,6 +272,14 @@ def collect_results(
             results["ece_over_time"] = np.asarray(ece_list, dtype=np.float32)
         if history.get("train_grad_norm"):
             results["train_grad_norm"] = np.asarray(history["train_grad_norm"], dtype=np.float32)
+        lr_list = history.get("learning_rate", [])
+        if len(lr_list) == n_epochs:
+            results["learning_rate"] = np.asarray(lr_list, dtype=np.float32)
+        train_acc = history.get("train_accuracy", [])
+        val_acc = history.get("val_accuracy", [])
+        if len(train_acc) == n_epochs and len(val_acc) == n_epochs:
+            results["train_accuracy"] = np.asarray(train_acc, dtype=np.float32)
+            results["val_accuracy"] = np.asarray(val_acc, dtype=np.float32)
 
     if save_path is not None:
         dirpath = os.path.dirname(save_path)
@@ -312,6 +377,7 @@ def train_model(
         "val_loss": [],
         "train_grad_norm": [],
         "ece": [],
+        "learning_rate": [],
     }
 
     # Logging backends -----------------------------------------------------
@@ -370,29 +436,46 @@ def train_model(
             print(f"Checkpoint is for model '{ckpt_model}', current is '{model_name}'; starting fresh.")
 
     for epoch in range(start_epoch, epochs + 1):
-        train_loss, train_grad_norm = train_epoch(model, train_loader, loss_fn, optimizer, device)
-        val_loss, reg_ece = eval_epoch(model, val_loader, loss_fn, device)
+        train_loss, train_grad_norm, train_accuracy = train_epoch(
+            model, train_loader, loss_fn, optimizer, device
+        )
+        val_loss, reg_ece, val_accuracy = eval_epoch(model, val_loader, loss_fn, device)
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
         history["train_grad_norm"].append(train_grad_norm)
         history["ece"].append(reg_ece)
-        print(f"Epoch {epoch:3d} | train_loss={train_loss:.6f} | val_loss={val_loss:.6f} | ECE={reg_ece:.4f}")
+        if train_accuracy is not None and val_accuracy is not None:
+            history.setdefault("train_accuracy", []).append(train_accuracy)
+            history.setdefault("val_accuracy", []).append(val_accuracy)
+        current_lr = float(optimizer.param_groups[0].get("lr", lr))
+        history["learning_rate"].append(current_lr)
+        msg = f"Epoch {epoch:3d} | train_loss={train_loss:.6f} | val_loss={val_loss:.6f} | ECE={reg_ece:.4f}"
+        if train_accuracy is not None and val_accuracy is not None:
+            msg += f" | acc={val_accuracy:.3f}"
+        print(msg)
 
         # Scalar logging ---------------------------------------------------
         if writer is not None:
             writer.add_scalar("loss/train", train_loss, epoch)
             writer.add_scalar("loss/val", val_loss, epoch)
             writer.add_scalar("grad/mean_norm", train_grad_norm, epoch)
+            writer.add_scalar("lr/learning_rate", current_lr, epoch)
+            if train_accuracy is not None and val_accuracy is not None:
+                writer.add_scalar("accuracy/train", train_accuracy, epoch)
+                writer.add_scalar("accuracy/val", val_accuracy, epoch)
 
         if use_wandb:
-            wandb.log(
-                {
-                    "epoch": epoch,
-                    "loss/train": train_loss,
-                    "loss/val": val_loss,
-                    "grad/mean_norm": train_grad_norm,
-                }
-            )
+            log_data = {
+                "epoch": epoch,
+                "loss/train": train_loss,
+                "loss/val": val_loss,
+                "grad/mean_norm": train_grad_norm,
+                "lr": current_lr,
+            }
+            if train_accuracy is not None and val_accuracy is not None:
+                log_data["accuracy/train"] = train_accuracy
+                log_data["accuracy/val"] = val_accuracy
+            wandb.log(log_data)
 
         # Checkpointing on improvement
         if val_loss < best_val_loss:

@@ -112,11 +112,10 @@ def train_epoch(
     device: torch.device,
 ) -> Tuple[float, float, float | None]:
     model.train()
-    total_loss = 0.0
-    total_grad_norm = 0.0
-    num_batches = 0
-    correct = 0
-    accuracy_samples = 0
+    total_loss_list = []
+    total_grad_norm_list = []
+    correct_list = []
+    accuracy_samples_list = []
 
     for x, y in loader:
         x, y = x.to(device), y.to(device)
@@ -127,23 +126,28 @@ def train_epoch(
         loss.backward()
 
         # Aggregate global gradient norm across all parameters for this batch.
-        total = 0.0
+        total_sq = []
         for p in model.parameters():
             if p.grad is not None:
                 param_norm = p.grad.detach().data.norm(2)
-                total += float(param_norm.item()) ** 2
-        batch_grad_norm = float(total**0.5)
+                total_sq.append(float(param_norm.item()) ** 2)
+        batch_grad_norm = float(sum(total_sq) ** 0.5)
 
         optimizer.step()
 
-        total_loss += loss.item() * x.size(0)
-        total_grad_norm += batch_grad_norm
-        num_batches += 1
+        total_loss_list.append(float(loss.item()) * x.shape[0])
+        total_grad_norm_list.append(batch_grad_norm)
 
         acc_counts = _classification_accuracy_counts(preds, y)
         if acc_counts is not None:
-            correct += acc_counts[0]
-            accuracy_samples += acc_counts[1]
+            correct_list.append(acc_counts[0])
+            accuracy_samples_list.append(acc_counts[1])
+
+    num_batches = len(total_loss_list)
+    total_loss = sum(total_loss_list)
+    total_grad_norm = sum(total_grad_norm_list)
+    correct = sum(correct_list)
+    accuracy_samples = sum(accuracy_samples_list)
 
     mean_grad_norm = total_grad_norm / max(num_batches, 1)
     accuracy = correct / accuracy_samples if accuracy_samples > 0 else None
@@ -160,11 +164,11 @@ def eval_epoch(
 ) -> Tuple[float, float, float | None]:
     """Returns (mean_val_loss, regression_calibration_error, accuracy)."""
     model.eval()
-    total_loss = 0.0
-    all_preds: List[torch.Tensor] = []
-    all_targets: List[torch.Tensor] = []
-    correct = 0
-    accuracy_samples = 0
+    total_loss_list = []
+    all_preds = []
+    all_targets = []
+    correct_list = []
+    accuracy_samples_list = []
 
     with torch.no_grad():
         for x, y in loader:
@@ -172,14 +176,18 @@ def eval_epoch(
             preds = model(x)
             loss = loss_fn(preds, y)
             if torch.isfinite(loss).all():
-                total_loss += loss.item() * x.size(0)
+                total_loss_list.append(float(loss.item()) * x.shape[0])
             all_preds.append(preds.cpu().numpy())
             all_targets.append(y.cpu().numpy())
 
             acc_counts = _classification_accuracy_counts(preds, y)
             if acc_counts is not None:
-                correct += acc_counts[0]
-                accuracy_samples += acc_counts[1]
+                correct_list.append(acc_counts[0])
+                accuracy_samples_list.append(acc_counts[1])
+
+    total_loss = sum(total_loss_list)
+    correct = sum(correct_list)
+    accuracy_samples = sum(accuracy_samples_list)
 
     n = len(loader.dataset)
     val_loss = total_loss / max(n, 1)
@@ -504,18 +512,6 @@ def train_model(
                     f"Early stopping: no improvement in val loss for "
                     f"{epochs_without_improvement} epochs."
                 )
-                break
-
-    # Close logging backends
-    if writer is not None:
-        writer.close()
-    if use_wandb:
-        wandb.finish()
-
-    # Optionally collect detailed results on the validation set for analysis.
-    if results_path is not None:
-        print(f"Collecting detailed results on validation set to {results_path}")
-        collect_results(model, val_loader, device, save_path=results_path, history=history)
 
     return model, history
 

@@ -1,19 +1,19 @@
 """Hyperparameter tuning script for model variants.
 
 Supports grid search, random search, and Optuna (if installed).
-Results are saved to CSV/JSONL under results/tuning by default.
+Results are saved under results/hyperparameter_tuning by default.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import itertools
 import json
 import os
 import random
 import sys
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
@@ -33,6 +33,33 @@ except Exception:  # pragma: no cover - optional dependency
     OPTUNA_AVAILABLE = False
 
 from experiments.train import train_model
+
+MODEL_ALIASES = {
+    "mlp": "mlp",
+    "deep": "deep",
+    "deep_mlp": "deep",
+    "rnn": "rnn",
+    "vanilla_rnn": "rnn",
+    "lstm": "lstm",
+    "residual": "residual",
+    "residual_mlp": "residual",
+}
+
+MODEL_OUTPUT_DIR = {
+    "mlp": "mlp",
+    "deep": "deep_mlp",
+    "rnn": "vanilla_rnn",
+    "lstm": "lstm",
+    "residual": "residual_mlp",
+}
+
+MODEL_INGEST_DIR = {
+    "mlp": "mlp",
+    "deep": "deep",
+    "rnn": "rnn",
+    "lstm": "lstm",
+    "residual": "residual",
+}
 
 
 @dataclass
@@ -100,7 +127,6 @@ def build_search_space(model: str) -> Dict[str, Iterable]:
         return {
             "hidden_size": [32, 64, 128, 256],
             "lr": lrs,
-            "seq_len": [10, 20, 30],
         }
     if model == "residual":
         return {
@@ -190,15 +216,16 @@ def run_trial(
     trial_id: int,
     cfg: TrialConfig,
     data_path: str,
-    checkpoint_dir: str,
-    results_dir: str,
+    run_dir: str,
+    run_name: str,
     early_stopping_patience: int,
     log_backend: str,
     log_dir: str,
     wandb_project: str | None,
 ) -> Dict[str, object]:
-    checkpoint_path = os.path.join(checkpoint_dir, f"{cfg.model}_trial_{trial_id}.pt")
-    trial_results_path = os.path.join(results_dir, f"trial_{trial_id}", "results.npz")
+    os.makedirs(run_dir, exist_ok=True)
+    checkpoint_path = os.path.join(run_dir, "checkpoint.pt")
+    trial_results_path = os.path.join(run_dir, "results.npz")
 
     model, history = train_model(
         model_name=cfg.model,
@@ -231,10 +258,199 @@ def run_trial(
     summary = summarize_history(history)
     record: Dict[str, object] = {
         "trial_id": trial_id,
+        "run_name": run_name,
+        "run_dir": run_dir,
         **cfg.to_dict(),
         **summary,
     }
     return record
+
+
+def _format_lr(lr: float) -> str:
+    text = f"{lr:.6f}"
+    text = text.rstrip("0").rstrip(".")
+    return text if text else "0"
+
+
+def run_slug(cfg: TrialConfig, model: str) -> str:
+    if model in ("mlp", "residual", "rnn", "lstm"):
+        return f"h{cfg.rnn_hidden_size}_lr{_format_lr(cfg.lr)}"
+    if model == "deep":
+        depth = len(cfg.deep_hidden_sizes) if cfg.deep_hidden_sizes else 0
+        return f"d{depth}_lr{_format_lr(cfg.lr)}"
+    return f"trial_{_format_lr(cfg.lr)}"
+
+
+def _parse_list_field(value: object) -> List[int] | None:
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return [int(v) for v in value]
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw or raw.lower() == "none":
+            return None
+        parts = [p for p in raw.split("|") if p]
+        if not parts:
+            return None
+        return [int(float(p)) for p in parts]
+    return None
+
+
+def _run_slug_from_record(record: Dict[str, object], model: str) -> str:
+    lr = float(record.get("lr", 0.0))
+    if model == "deep":
+        deep_sizes = _parse_list_field(record.get("deep_hidden_sizes"))
+        depth = len(deep_sizes) if deep_sizes else 0
+        return f"d{depth}_lr{_format_lr(lr)}"
+    if model in ("mlp", "rnn", "lstm", "residual"):
+        hidden_size = None
+        mlp_sizes = _parse_list_field(record.get("mlp_hidden_sizes"))
+        if mlp_sizes:
+            hidden_size = mlp_sizes[0]
+        for key in ("rnn_hidden_size", "lstm_hidden_size", "residual_hidden_size"):
+            if hidden_size is None and record.get(key) is not None:
+                hidden_size = int(float(record[key]))  # type: ignore[arg-type]
+        if hidden_size is None:
+            hidden_size = 0
+        return f"h{hidden_size}_lr{_format_lr(lr)}"
+    return f"trial_{_format_lr(lr)}"
+
+
+def _read_csv_records(path: str) -> List[Dict[str, object]]:
+    records: List[Dict[str, object]] = []
+    with open(path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            records.append(dict(row))
+    return records
+
+
+def _read_jsonl_records(path: str) -> List[Dict[str, object]]:
+    records: List[Dict[str, object]] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            records.append(json.loads(line))
+    return records
+
+
+def _coerce_types(record: Dict[str, object]) -> Dict[str, object]:
+    int_fields = {
+        "trial_id",
+        "seq_len",
+        "batch_size",
+        "epochs",
+        "split_seed",
+        "rnn_num_layers",
+        "lstm_num_layers",
+        "residual_num_blocks",
+        "best_epoch",
+    }
+    float_fields = {
+        "lr",
+        "val_ratio",
+        "dropout",
+        "best_val_loss",
+        "final_val_loss",
+        "final_train_loss",
+        "final_ece",
+        "final_val_accuracy",
+        "final_train_accuracy",
+    }
+    list_fields = {"mlp_hidden_sizes", "deep_hidden_sizes"}
+
+    coerced: Dict[str, object] = {}
+    for key, value in record.items():
+        if isinstance(value, str):
+            raw = value.strip()
+            if raw.lower() == "none" or raw == "":
+                coerced[key] = None
+                continue
+        if key in list_fields:
+            coerced[key] = _parse_list_field(value)
+            continue
+        if key in int_fields and value is not None:
+            coerced[key] = int(float(value))  # handles "42.0"
+            continue
+        if key in float_fields and value is not None:
+            coerced[key] = float(value)
+            continue
+        coerced[key] = value
+    return coerced
+
+
+def ingest_results(
+    model_key: str,
+    ingest_from: str,
+    ingest_run: str | None,
+    output_dir: str,
+) -> None:
+    ingest_model_dir = os.path.join(ingest_from, MODEL_INGEST_DIR[model_key])
+    if not os.path.isdir(ingest_model_dir):
+        raise FileNotFoundError(f"No tuning directory found at {ingest_model_dir}")
+
+    if ingest_run:
+        run_dir = os.path.join(ingest_model_dir, ingest_run)
+        if not os.path.isdir(run_dir):
+            raise FileNotFoundError(f"No tuning run found at {run_dir}")
+    else:
+        run_dirs = [
+            os.path.join(ingest_model_dir, d)
+            for d in os.listdir(ingest_model_dir)
+            if os.path.isdir(os.path.join(ingest_model_dir, d))
+        ]
+        if not run_dirs:
+            raise FileNotFoundError(f"No tuning runs found under {ingest_model_dir}")
+        run_dir = max(run_dirs, key=os.path.getmtime)
+
+    csv_path = os.path.join(run_dir, "tuning_results.csv")
+    jsonl_path = os.path.join(run_dir, "tuning_results.jsonl")
+    if os.path.exists(csv_path):
+        raw_records = _read_csv_records(csv_path)
+    elif os.path.exists(jsonl_path):
+        raw_records = _read_jsonl_records(jsonl_path)
+    else:
+        raise FileNotFoundError(f"No tuning results found in {run_dir}")
+
+    model_dir = os.path.join(output_dir, MODEL_OUTPUT_DIR[model_key])
+    runs_dir = os.path.join(model_dir, "runs")
+    os.makedirs(runs_dir, exist_ok=True)
+
+    records: List[Dict[str, object]] = []
+    checkpoints_dir = os.path.join(run_dir, "checkpoints")
+
+    for raw in raw_records:
+        rec = _coerce_types(raw)
+        trial_id = int(rec.get("trial_id") or 0)
+        run_name = _run_slug_from_record(rec, model_key)
+        new_run_dir = os.path.join(runs_dir, run_name)
+        os.makedirs(new_run_dir, exist_ok=True)
+
+        # Copy trial artifacts if present.
+        old_trial_dir = os.path.join(run_dir, f"trial_{trial_id}")
+        old_results = os.path.join(old_trial_dir, "results.npz")
+        if os.path.exists(old_results):
+            new_results = os.path.join(new_run_dir, "results.npz")
+            if not os.path.exists(new_results):
+                with open(old_results, "rb") as src, open(new_results, "wb") as dst:
+                    dst.write(src.read())
+
+        old_ckpt = os.path.join(checkpoints_dir, f"{model_key}_trial_{trial_id}.pt")
+        new_ckpt = os.path.join(new_run_dir, "checkpoint.pt")
+        if os.path.exists(old_ckpt) and not os.path.exists(new_ckpt):
+            with open(old_ckpt, "rb") as src, open(new_ckpt, "wb") as dst:
+                dst.write(src.read())
+
+        rec["run_name"] = run_name
+        rec["run_dir"] = new_run_dir
+        records.append(rec)
+
+    out_csv = os.path.join(model_dir, "results.csv")
+    out_jsonl = os.path.join(model_dir, "results.jsonl")
+    save_results(records, out_csv, out_jsonl)
 
 
 def save_results(records: List[Dict[str, object]], out_csv: str, out_jsonl: str) -> None:
@@ -259,7 +475,21 @@ def save_results(records: List[Dict[str, object]], out_csv: str, out_jsonl: str)
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Hyperparameter tuning for calibration-confidence models")
-    parser.add_argument("--model", type=str, default="mlp", choices=["mlp", "deep", "rnn", "lstm", "residual"])
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="mlp",
+        choices=[
+            "mlp",
+            "deep",
+            "deep_mlp",
+            "rnn",
+            "vanilla_rnn",
+            "lstm",
+            "residual",
+            "residual_mlp",
+        ],
+    )
     parser.add_argument("--data-path", type=str, default="data/finsen/raw")
     parser.add_argument("--seq-len", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=128)
@@ -279,16 +509,40 @@ def main() -> None:
     parser.add_argument("--log-backend", type=str, default="none", choices=["none", "tensorboard", "wandb"])
     parser.add_argument("--log-dir", type=str, default="results/logs")
     parser.add_argument("--wandb-project", type=str, default=None)
-    parser.add_argument("--results-dir", type=str, default="results/tuning")
+    parser.add_argument("--results-dir", type=str, default="results/hyperparameter_tuning")
+    parser.add_argument(
+        "--ingest-from",
+        type=str,
+        default=None,
+        help="Ingest existing tuning outputs instead of training (e.g., results/tuning).",
+    )
+    parser.add_argument(
+        "--ingest-run",
+        type=str,
+        default=None,
+        help="Specific run directory under --ingest-from/<model> to ingest.",
+    )
     args = parser.parse_args()
 
     set_seed(args.seed)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = os.path.join(args.results_dir, args.model, f"{args.method}_{timestamp}")
-    os.makedirs(run_dir, exist_ok=True)
-    checkpoint_dir = os.path.join(run_dir, "checkpoints")
-    os.makedirs(checkpoint_dir, exist_ok=True)
+    model_key = MODEL_ALIASES.get(args.model)
+    if model_key is None:
+        raise ValueError(f"Unknown model '{args.model}'")
+    model_dir_name = MODEL_OUTPUT_DIR[model_key]
+    model_dir = os.path.join(args.results_dir, model_dir_name)
+    runs_dir = os.path.join(model_dir, "runs")
+    os.makedirs(runs_dir, exist_ok=True)
+
+    if args.ingest_from:
+        ingest_results(
+            model_key=model_key,
+            ingest_from=args.ingest_from,
+            ingest_run=args.ingest_run,
+            output_dir=args.results_dir,
+        )
+        print(f"Ingested tuning results into: {model_dir}")
+        return
 
     base = {
         "seq_len": args.seq_len,
@@ -309,14 +563,16 @@ def main() -> None:
     records: List[Dict[str, object]] = []
 
     if args.method == "grid":
-        configs = grid_configs(args.model, base)
+        configs = grid_configs(model_key, base)
         for idx, cfg in enumerate(configs, start=1):
+            run_name = run_slug(cfg, model_key)
+            run_dir = os.path.join(runs_dir, run_name)
             rec = run_trial(
                 trial_id=idx,
                 cfg=cfg,
                 data_path=args.data_path,
-                checkpoint_dir=checkpoint_dir,
-                results_dir=run_dir,
+                run_dir=run_dir,
+                run_name=run_name,
                 early_stopping_patience=args.early_stopping_patience,
                 log_backend=args.log_backend,
                 log_dir=args.log_dir,
@@ -324,16 +580,18 @@ def main() -> None:
             )
             records.append(rec)
     elif args.method == "random":
-        configs = grid_configs(args.model, base)
+        configs = grid_configs(model_key, base)
         random.shuffle(configs)
         configs = configs[: args.n_trials]
         for idx, cfg in enumerate(configs, start=1):
+            run_name = run_slug(cfg, model_key)
+            run_dir = os.path.join(runs_dir, run_name)
             rec = run_trial(
                 trial_id=idx,
                 cfg=cfg,
                 data_path=args.data_path,
-                checkpoint_dir=checkpoint_dir,
-                results_dir=run_dir,
+                run_dir=run_dir,
+                run_name=run_name,
                 early_stopping_patience=args.early_stopping_patience,
                 log_backend=args.log_backend,
                 log_dir=args.log_dir,
@@ -346,7 +604,7 @@ def main() -> None:
 
         def objective(trial: "optuna.trial.Trial") -> float:
             params: Dict[str, object] = {}
-            space = build_search_space(args.model)
+            space = build_search_space(model_key)
             if "hidden_size" in space:
                 params["hidden_size"] = trial.suggest_categorical("hidden_size", list(space["hidden_size"]))
             if "depth" in space:
@@ -355,13 +613,15 @@ def main() -> None:
                 params["seq_len"] = trial.suggest_categorical("seq_len", list(space["seq_len"]))
             if "lr" in space:
                 params["lr"] = trial.suggest_categorical("lr", list(space["lr"]))
-            cfg = make_config(args.model, base, params)
+            cfg = make_config(model_key, base, params)
+            run_name = run_slug(cfg, model_key)
+            run_dir = os.path.join(runs_dir, run_name)
             rec = run_trial(
                 trial_id=trial.number + 1,
                 cfg=cfg,
                 data_path=args.data_path,
-                checkpoint_dir=checkpoint_dir,
-                results_dir=run_dir,
+                run_dir=run_dir,
+                run_name=run_name,
                 early_stopping_patience=args.early_stopping_patience,
                 log_backend=args.log_backend,
                 log_dir=args.log_dir,
@@ -373,8 +633,8 @@ def main() -> None:
         study = optuna.create_study(direction="minimize")
         study.optimize(objective, n_trials=args.n_trials)
 
-    out_csv = os.path.join(run_dir, "tuning_results.csv")
-    out_jsonl = os.path.join(run_dir, "tuning_results.jsonl")
+    out_csv = os.path.join(model_dir, "results.csv")
+    out_jsonl = os.path.join(model_dir, "results.jsonl")
     save_results(records, out_csv, out_jsonl)
 
     if records:

@@ -1,0 +1,6 @@
+model,metric,metric_direction,num_trials,best_value,worst_value,best_run_name,worst_run_name,best_hidden_size,best_depth,best_lr,worst_hidden_size,worst_depth,worst_lr,top_param_1,top_param_1_importance,top_param_2,top_param_2_importance,top_param_3,top_param_3_importance
+mlp,final_ece,lower_is_better,16,25.25587851541084,55.44546602483382,h32_lr0.0005,h64_lr0.0005,32,,0.0005,64,,0.0005,lr,0.529168262497929,hidden_size,0.470831737502071,,
+deep_mlp,final_ece,lower_is_better,16,26.934292575769256,128.69425355342395,d6_lr0.0001,d4_lr0.01,128,6.0,0.0001,128,4.0,0.01,lr,0.5169882993585351,depth,0.483011700641465,hidden_size,0.0
+residual_mlp,final_ece,lower_is_better,16,21.87656188429448,125.01603096409846,h32_lr0.0005,h128_lr0.001,32,,0.0005,128,,0.001,lr,0.5338770719631634,hidden_size,0.4661229280368367,,
+vanilla_rnn,final_ece,lower_is_better,16,0.0,483.7058635510897,h32_lr0.01,h32_lr0.0001,32,,0.01,32,,0.0001,lr,0.9831300126787782,hidden_size,0.016869987321221837,,
+lstm,final_ece,lower_is_better,16,0.0,483.46305807013255,h64_lr0.01,h32_lr0.0001,64,,0.01,32,,0.0001,lr,0.7753991974910964,hidden_size,0.22460080250890363,,

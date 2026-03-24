@@ -1,0 +1,36 @@
+Sensitivity Takeaways
+
+Model: mlp
+- Metric: final_ece (lower_is_better)
+- Best vs Worst: 25.2559 vs 55.4455
+- Best config: hidden_size=32, lr=0.0005
+- Worst config: hidden_size=64, lr=0.0005
+- Most sensitive params: lr (0.529), hidden_size (0.471)
+
+Model: deep_mlp
+- Metric: final_ece (lower_is_better)
+- Best vs Worst: 26.9343 vs 128.694
+- Best config: hidden_size=128, depth=6, lr=0.0001
+- Worst config: hidden_size=128, depth=4, lr=0.01
+- Most sensitive params: lr (0.517), depth (0.483), hidden_size (0.000)
+
+Model: residual_mlp
+- Metric: final_ece (lower_is_better)
+- Best vs Worst: 21.8766 vs 125.016
+- Best config: hidden_size=32, lr=0.0005
+- Worst config: hidden_size=128, lr=0.001
+- Most sensitive params: lr (0.534), hidden_size (0.466)
+
+Model: vanilla_rnn
+- Metric: final_ece (lower_is_better)
+- Best vs Worst: 0 vs 483.706
+- Best config: hidden_size=32, lr=0.01
+- Worst config: hidden_size=32, lr=0.0001
+- Most sensitive params: lr (0.983), hidden_size (0.017)
+
+Model: lstm
+- Metric: final_ece (lower_is_better)
+- Best vs Worst: 0 vs 483.463
+- Best config: hidden_size=64, lr=0.01
+- Worst config: hidden_size=32, lr=0.0001
+- Most sensitive params: lr (0.775), hidden_size (0.225)

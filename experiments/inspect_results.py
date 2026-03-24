@@ -1,6 +1,12 @@
+import argparse
+
 import numpy as np
 
-data = np.load("results/first_results.npz")
+parser = argparse.ArgumentParser(description="Inspect saved training results")
+parser.add_argument("--path", type=str, default="results/first_results.npz", help="Path to .npz results file")
+args = parser.parse_args()
+
+data = np.load(args.path)
 keys = list(data.keys())
 print("Available keys:", keys)
 

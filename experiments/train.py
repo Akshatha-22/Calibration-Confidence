@@ -52,12 +52,18 @@ from models.residual_mlp import build_residual_mlp
 from calibration.ece import expected_calibration_error, regression_calibration_error
 
 
-def split_dataset(dataset: FinSenDataset, val_ratio: float = 0.2) -> Tuple[Subset, Subset]:
+def split_dataset(
+    dataset: FinSenDataset, val_ratio: float = 0.2, seed: int | None = None
+) -> Tuple[Subset, Subset]:
     """Split dataset into train and validation subsets."""
     n = len(dataset)
     val_size = int(n * val_ratio)
     train_size = n - val_size
-    indices = torch.randperm(n).tolist()
+    generator = None
+    if seed is not None:
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+    indices = torch.randperm(n, generator=generator).tolist()
     train_idx = indices[:train_size]
     val_idx = indices[train_size:]
     return Subset(dataset, train_idx), Subset(dataset, val_idx)
@@ -306,6 +312,16 @@ def train_model(
     epochs: int,
     lr: float,
     val_ratio: float,
+    split_seed: int | None = None,
+    mlp_hidden_sizes: Tuple[int, ...] | None = None,
+    deep_hidden_sizes: Tuple[int, ...] | None = None,
+    rnn_hidden_size: int = 64,
+    rnn_num_layers: int = 1,
+    lstm_hidden_size: int = 64,
+    lstm_num_layers: int = 1,
+    residual_hidden_size: int = 128,
+    residual_num_blocks: int = 3,
+    dropout: float = 0.0,
     device: torch.device | None = None,
     checkpoint_path: str | None = None,
     resume: bool = True,
@@ -330,7 +346,7 @@ def train_model(
     print(f"Using device: {device}")
 
     dataset = FinSenDataset(data_path=data_path, seq_length=seq_len)
-    train_ds, val_ds = split_dataset(dataset, val_ratio=val_ratio)
+    train_ds, val_ds = split_dataset(dataset, val_ratio=val_ratio, seed=split_seed)
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
@@ -341,40 +357,40 @@ def train_model(
         model = build_deep_mlp(
             seq_len=seq_len,
             num_features=num_features,
-            hidden_sizes=(256, 128, 64, 32),
-            dropout=0.0,
+            hidden_sizes=deep_hidden_sizes or (256, 128, 64, 32),
+            dropout=dropout,
         ).to(device)
     elif model_name == "rnn":
         model = build_vanilla_rnn(
             seq_len=seq_len,
             num_features=num_features,
-            hidden_size=64,
-            num_layers=1,
-            dropout=0.0,
+            hidden_size=rnn_hidden_size,
+            num_layers=rnn_num_layers,
+            dropout=dropout,
         ).to(device)
     elif model_name == "lstm":
         model = build_lstm(
             seq_len=seq_len,
             num_features=num_features,
-            hidden_size=64,
-            num_layers=1,
-            dropout=0.0,
+            hidden_size=lstm_hidden_size,
+            num_layers=lstm_num_layers,
+            dropout=dropout,
         ).to(device)
     elif model_name == "residual":
         model = build_residual_mlp(
             seq_len=seq_len,
             num_features=num_features,
-            hidden_size=128,
-            num_blocks=3,
-            dropout=0.0,
+            hidden_size=residual_hidden_size,
+            num_blocks=residual_num_blocks,
+            dropout=dropout,
         ).to(device)
     else:
         # Default: shallow MLP
         model = build_mlp(
             seq_len=seq_len,
             num_features=num_features,
-            hidden_sizes=(128, 64),
-            dropout=0.0,
+            hidden_sizes=mlp_hidden_sizes or (128, 64),
+            dropout=dropout,
         ).to(device)
 
     loss_fn = nn.MSELoss()
@@ -512,6 +528,16 @@ def train_model(
                     f"Early stopping: no improvement in val loss for "
                     f"{epochs_without_improvement} epochs."
                 )
+                break
+
+    if results_path:
+        collect_results(
+            model=model,
+            loader=val_loader,
+            device=device,
+            save_path=results_path,
+            history=history,
+        )
 
     return model, history
 
@@ -525,6 +551,16 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--val-ratio", type=float, default=0.2, help="Fraction of data to use for validation")
     parser.add_argument("--model", type=str, default="mlp", choices=["mlp", "deep", "rnn", "lstm", "residual"], help="Model type: 'mlp', 'deep', 'rnn', 'lstm', 'residual'")
+    parser.add_argument("--split-seed", type=int, default=None, help="Random seed for train/val split")
+    parser.add_argument("--dropout", type=float, default=0.0, help="Dropout probability")
+    parser.add_argument("--mlp-hidden-sizes", type=str, default=None, help="Comma-separated hidden sizes for MLP (e.g. 128,64)")
+    parser.add_argument("--deep-hidden-sizes", type=str, default=None, help="Comma-separated hidden sizes for deep MLP")
+    parser.add_argument("--rnn-hidden-size", type=int, default=64, help="Hidden size for vanilla RNN")
+    parser.add_argument("--rnn-num-layers", type=int, default=1, help="Number of layers for vanilla RNN")
+    parser.add_argument("--lstm-hidden-size", type=int, default=64, help="Hidden size for LSTM")
+    parser.add_argument("--lstm-num-layers", type=int, default=1, help="Number of layers for LSTM")
+    parser.add_argument("--residual-hidden-size", type=int, default=128, help="Hidden size for residual MLP blocks")
+    parser.add_argument("--residual-num-blocks", type=int, default=3, help="Number of residual blocks")
     parser.add_argument("--checkpoint-path", type=str, default="results/checkpoints/model.pt", help="Path to save model checkpoints")
     parser.add_argument("--no-resume", action="store_true", help="Do not resume from an existing checkpoint")
     parser.add_argument("--early-stopping-patience", type=int, default=10, help="Early stopping patience in epochs")
@@ -534,6 +570,14 @@ def main() -> None:
     parser.add_argument("--wandb-run-name", type=str, default=None, help="Weights & Biases run name")
     parser.add_argument("--results-path", type=str, default="results/first_results.npz", help="Path to save detailed predictions/confidences/ECE")
     args = parser.parse_args()
+
+    def _parse_sizes(raw: str | None) -> Tuple[int, ...] | None:
+        if raw is None:
+            return None
+        items = [s.strip() for s in raw.split(",") if s.strip()]
+        if not items:
+            return None
+        return tuple(int(s) for s in items)
 
     # Call the unified training loop. We ignore the returned objects here,
     # but other experiment scripts can reuse ``train_model`` directly to
@@ -546,6 +590,16 @@ def main() -> None:
         epochs=args.epochs,
         lr=args.lr,
         val_ratio=args.val_ratio,
+        split_seed=args.split_seed,
+        mlp_hidden_sizes=_parse_sizes(args.mlp_hidden_sizes),
+        deep_hidden_sizes=_parse_sizes(args.deep_hidden_sizes),
+        rnn_hidden_size=args.rnn_hidden_size,
+        rnn_num_layers=args.rnn_num_layers,
+        lstm_hidden_size=args.lstm_hidden_size,
+        lstm_num_layers=args.lstm_num_layers,
+        residual_hidden_size=args.residual_hidden_size,
+        residual_num_blocks=args.residual_num_blocks,
+        dropout=args.dropout,
         checkpoint_path=args.checkpoint_path,
         resume=not args.no_resume,
         early_stopping_patience=args.early_stopping_patience,

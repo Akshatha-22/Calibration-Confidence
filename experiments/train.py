@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from typing import Dict, List, Tuple
 
 # Ensure repo root is on sys.path when running this script directly.
@@ -44,6 +45,7 @@ except Exception:  # pragma: no cover - optional dependency
     WANDB_AVAILABLE = False
 
 from data.preprocessing import FinSenDataset
+from data.preprocessing.data_loaders import get_mlp_loaders, get_rnn_loaders
 from models.mlp import build_mlp
 from models.deep_mlp import build_deep_mlp
 from models.vanilla_rnn import build_vanilla_rnn
@@ -110,12 +112,81 @@ def _classification_accuracy_counts(
     return correct, total
 
 
+def _prepare_sequence_batch(x: torch.Tensor, model_name: str) -> torch.Tensor:
+    """Ensure sequence inputs are shaped for RNN/LSTM classifiers."""
+    if model_name in ("rnn", "lstm"):
+        if x.ndim == 2:
+            # Token id sequences -> treat as single feature channel
+            return x.float().unsqueeze(-1)
+    return x
+
+
+def _logits_to_probs(logits: np.ndarray) -> np.ndarray:
+    """Convert logits to probabilities for binary/multi-class."""
+    logits = np.asarray(logits)
+    if logits.ndim == 1:
+        # (N,) -> binary logits
+        probs_pos = 1.0 / (1.0 + np.exp(-logits))
+        return np.stack([1.0 - probs_pos, probs_pos], axis=1)
+    if logits.shape[1] == 1:
+        probs_pos = 1.0 / (1.0 + np.exp(-logits.reshape(-1)))
+        return np.stack([1.0 - probs_pos, probs_pos], axis=1)
+    # Multi-class
+    logits_max = np.max(logits, axis=1, keepdims=True)
+    exp_logits = np.exp(np.clip(logits - logits_max, -50, 50))
+    return exp_logits / np.sum(exp_logits, axis=1, keepdims=True)
+
+
+def _binary_metrics_from_probs(
+    probs: np.ndarray, labels: np.ndarray
+) -> Dict[str, float]:
+    """Compute binary classification metrics from probs and labels."""
+    labels = labels.astype(int).reshape(-1)
+    probs_pos = probs[:, 1]
+    preds = (probs_pos >= 0.5).astype(int)
+
+    tp = int(((preds == 1) & (labels == 1)).sum())
+    tn = int(((preds == 0) & (labels == 0)).sum())
+    fp = int(((preds == 1) & (labels == 0)).sum())
+    fn = int(((preds == 0) & (labels == 1)).sum())
+
+    total = len(labels)
+    accuracy = (tp + tn) / total if total > 0 else 0.0
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+
+    confidences = np.max(probs, axis=1)
+    correct_mask = preds == labels
+    incorrect_mask = ~correct_mask
+    avg_confidence = float(np.mean(confidences)) if total > 0 else 0.0
+    conf_correct = float(np.mean(confidences[correct_mask])) if np.any(correct_mask) else float("nan")
+    conf_incorrect = (
+        float(np.mean(confidences[incorrect_mask])) if np.any(incorrect_mask) else float("nan")
+    )
+
+    brier = float(np.mean((probs_pos - labels) ** 2)) if total > 0 else 0.0
+
+    return {
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "brier": brier,
+        "avg_confidence": avg_confidence,
+        "confidence_correct": conf_correct,
+        "confidence_incorrect": conf_incorrect,
+    }
+
+
 def train_epoch(
     model: nn.Module,
     loader: DataLoader,
     loss_fn: nn.Module,
     optimizer: optim.Optimizer,
     device: torch.device,
+    task: str,
+    model_name: str,
 ) -> Tuple[float, float, float | None]:
     model.train()
     total_loss_list = []
@@ -125,6 +196,8 @@ def train_epoch(
 
     for x, y in loader:
         x, y = x.to(device), y.to(device)
+        if task == "classification":
+            x = _prepare_sequence_batch(x, model_name)
         preds = model(x)
         loss = loss_fn(preds, y)
 
@@ -144,10 +217,15 @@ def train_epoch(
         total_loss_list.append(float(loss.item()) * x.shape[0])
         total_grad_norm_list.append(batch_grad_norm)
 
-        acc_counts = _classification_accuracy_counts(preds, y)
-        if acc_counts is not None:
-            correct_list.append(acc_counts[0])
-            accuracy_samples_list.append(acc_counts[1])
+        if task == "classification":
+            pred_labels = preds.argmax(dim=-1)
+            correct_list.append(int((pred_labels == y).sum().item()))
+            accuracy_samples_list.append(int(y.numel()))
+        else:
+            acc_counts = _classification_accuracy_counts(preds, y)
+            if acc_counts is not None:
+                correct_list.append(acc_counts[0])
+                accuracy_samples_list.append(acc_counts[1])
 
     num_batches = len(total_loss_list)
     total_loss = sum(total_loss_list)
@@ -161,20 +239,18 @@ def train_epoch(
     return total_loss / len(loader.dataset), mean_grad_norm, accuracy
 
 
-def eval_epoch(
+def eval_epoch_regression(
     model: nn.Module,
     loader: DataLoader,
     loss_fn: nn.Module,
     device: torch.device,
     n_bins: int = 10,
-) -> Tuple[float, float, float | None]:
-    """Returns (mean_val_loss, regression_calibration_error, accuracy)."""
+) -> Dict[str, float]:
+    """Evaluation for regression tasks."""
     model.eval()
     total_loss_list = []
     all_preds = []
     all_targets = []
-    correct_list = []
-    accuracy_samples_list = []
 
     with torch.no_grad():
         for x, y in loader:
@@ -186,22 +262,54 @@ def eval_epoch(
             all_preds.append(preds.cpu().numpy())
             all_targets.append(y.cpu().numpy())
 
-            acc_counts = _classification_accuracy_counts(preds, y)
-            if acc_counts is not None:
-                correct_list.append(acc_counts[0])
-                accuracy_samples_list.append(acc_counts[1])
-
     total_loss = sum(total_loss_list)
-    correct = sum(correct_list)
-    accuracy_samples = sum(accuracy_samples_list)
-
     n = len(loader.dataset)
     val_loss = total_loss / max(n, 1)
     preds_arr = np.concatenate(all_preds, axis=0)
     targets_arr = np.concatenate(all_targets, axis=0)
     reg_ece = regression_calibration_error(preds_arr, targets_arr, n_bins=n_bins)
-    accuracy = correct / accuracy_samples if accuracy_samples > 0 else None
-    return val_loss, float(reg_ece), accuracy
+    return {
+        "loss": float(val_loss),
+        "ece": float(reg_ece),
+    }
+
+
+def eval_epoch_classification(
+    model: nn.Module,
+    loader: DataLoader,
+    loss_fn: nn.Module,
+    device: torch.device,
+    model_name: str,
+    n_bins: int = 10,
+) -> Dict[str, float]:
+    """Evaluation for binary classification."""
+    model.eval()
+    total_loss_list = []
+    all_logits = []
+    all_targets = []
+
+    with torch.no_grad():
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            x = _prepare_sequence_batch(x, model_name)
+            logits = model(x)
+            loss = loss_fn(logits, y)
+            if torch.isfinite(loss).all():
+                total_loss_list.append(float(loss.item()) * x.shape[0])
+            all_logits.append(logits.cpu().numpy())
+            all_targets.append(y.cpu().numpy())
+
+    total_loss = sum(total_loss_list)
+    n = len(loader.dataset)
+    val_loss = total_loss / max(n, 1)
+
+    logits_arr = np.concatenate(all_logits, axis=0)
+    targets_arr = np.concatenate(all_targets, axis=0)
+    probs = _logits_to_probs(logits_arr)
+    metrics = _binary_metrics_from_probs(probs, targets_arr)
+    ece_val = expected_calibration_error(probs, targets_arr, n_bins=n_bins)
+    metrics.update({"loss": float(val_loss), "ece": float(ece_val)})
+    return metrics
 
 
 def collect_results(
@@ -304,6 +412,49 @@ def collect_results(
     return results
 
 
+def collect_classification_results(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    model_name: str,
+    save_path: str | None = None,
+) -> Dict[str, np.ndarray]:
+    """Collect logits/probs/labels for classification evaluation."""
+    model.eval()
+    all_logits: List[np.ndarray] = []
+    all_targets: List[np.ndarray] = []
+
+    with torch.no_grad():
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            x = _prepare_sequence_batch(x, model_name)
+            logits = model(x)
+            all_logits.append(logits.detach().cpu().numpy())
+            all_targets.append(y.detach().cpu().numpy())
+
+    logits_arr = np.concatenate(all_logits, axis=0)
+    targets_arr = np.concatenate(all_targets, axis=0)
+    probs = _logits_to_probs(logits_arr)
+    confidences = np.max(probs, axis=1)
+    pred_labels = np.argmax(probs, axis=1)
+
+    results: Dict[str, np.ndarray] = {
+        "logits": logits_arr,
+        "probs": probs,
+        "confidences": confidences,
+        "pred_labels": pred_labels,
+        "targets": targets_arr,
+    }
+
+    if save_path is not None:
+        dirpath = os.path.dirname(save_path)
+        if dirpath:
+            os.makedirs(dirpath, exist_ok=True)
+        np.savez_compressed(save_path, **results)
+
+    return results
+
+
 def train_model(
     model_name: str,
     data_path: str,
@@ -322,6 +473,12 @@ def train_model(
     residual_hidden_size: int = 128,
     residual_num_blocks: int = 3,
     dropout: float = 0.0,
+    task: str = "regression",
+    train_path: str = "data/finsen/processed/train.csv",
+    val_path: str = "data/finsen/processed/val.csv",
+    test_path: str = "data/finsen/processed/test.csv",
+    max_features: int = 2000,
+    max_seq_len: int = 128,
     device: torch.device | None = None,
     checkpoint_path: str | None = None,
     resume: bool = True,
@@ -345,20 +502,48 @@ def train_model(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    dataset = FinSenDataset(data_path=data_path, seq_length=seq_len)
-    train_ds, val_ds = split_dataset(dataset, val_ratio=val_ratio, seed=split_seed)
+    train_loader: DataLoader
+    val_loader: DataLoader
+    test_loader: DataLoader | None = None
+    num_features: int
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+    if task == "classification":
+        if model_name in ("rnn", "lstm"):
+            train_loader, val_loader, test_loader = get_rnn_loaders(
+                train_path=train_path,
+                val_path=val_path,
+                test_path=test_path,
+                batch_size=batch_size,
+                max_seq_len=max_seq_len,
+            )
+            num_features = 1
+        else:
+            train_loader, val_loader, test_loader = get_mlp_loaders(
+                train_path=train_path,
+                val_path=val_path,
+                test_path=test_path,
+                batch_size=batch_size,
+                max_features=max_features,
+            )
+            # infer feature size from one batch
+            sample_batch = next(iter(train_loader))[0]
+            num_features = int(sample_batch.shape[-1])
+    else:
+        dataset = FinSenDataset(data_path=data_path, seq_length=seq_len)
+        train_ds, val_ds = split_dataset(dataset, val_ratio=val_ratio, seed=split_seed)
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+        num_features = dataset.values.shape[1]
 
-    num_features = dataset.values.shape[1]
+    output_size = 2 if task == "classification" else None
 
     if model_name == "deep":
         model = build_deep_mlp(
-            seq_len=seq_len,
+            seq_len=1 if task == "classification" else seq_len,
             num_features=num_features,
             hidden_sizes=deep_hidden_sizes or (256, 128, 64, 32),
             dropout=dropout,
+            output_size=output_size,
         ).to(device)
     elif model_name == "rnn":
         model = build_vanilla_rnn(
@@ -367,6 +552,7 @@ def train_model(
             hidden_size=rnn_hidden_size,
             num_layers=rnn_num_layers,
             dropout=dropout,
+            output_size=output_size,
         ).to(device)
     elif model_name == "lstm":
         model = build_lstm(
@@ -375,25 +561,28 @@ def train_model(
             hidden_size=lstm_hidden_size,
             num_layers=lstm_num_layers,
             dropout=dropout,
+            output_size=output_size,
         ).to(device)
     elif model_name == "residual":
         model = build_residual_mlp(
-            seq_len=seq_len,
+            seq_len=1 if task == "classification" else seq_len,
             num_features=num_features,
             hidden_size=residual_hidden_size,
             num_blocks=residual_num_blocks,
             dropout=dropout,
+            output_size=output_size,
         ).to(device)
     else:
         # Default: shallow MLP
         model = build_mlp(
-            seq_len=seq_len,
+            seq_len=1 if task == "classification" else seq_len,
             num_features=num_features,
             hidden_sizes=mlp_hidden_sizes or (128, 64),
             dropout=dropout,
+            output_size=output_size,
         ).to(device)
 
-    loss_fn = nn.MSELoss()
+    loss_fn = nn.CrossEntropyLoss() if task == "classification" else nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
 
     history: Dict[str, List[float]] = {
@@ -403,6 +592,20 @@ def train_model(
         "ece": [],
         "learning_rate": [],
     }
+    if task == "classification":
+        history.update(
+            {
+                "train_accuracy": [],
+                "val_accuracy": [],
+                "val_precision": [],
+                "val_recall": [],
+                "val_f1": [],
+                "val_brier": [],
+                "val_avg_confidence": [],
+                "val_confidence_correct": [],
+                "val_confidence_incorrect": [],
+            }
+        )
 
     # Logging backends -----------------------------------------------------
     writer = None
@@ -459,22 +662,42 @@ def train_model(
         else:
             print(f"Checkpoint is for model '{ckpt_model}', current is '{model_name}'; starting fresh.")
 
+    start_time = time.perf_counter()
+
     for epoch in range(start_epoch, epochs + 1):
         train_loss, train_grad_norm, train_accuracy = train_epoch(
-            model, train_loader, loss_fn, optimizer, device
+            model, train_loader, loss_fn, optimizer, device, task, model_name
         )
-        val_loss, reg_ece, val_accuracy = eval_epoch(model, val_loader, loss_fn, device)
+        if task == "classification":
+            val_metrics = eval_epoch_classification(
+                model, val_loader, loss_fn, device, model_name
+            )
+            val_loss = val_metrics["loss"]
+            reg_ece = val_metrics["ece"]
+            val_accuracy = val_metrics["accuracy"]
+        else:
+            val_metrics = eval_epoch_regression(model, val_loader, loss_fn, device)
+            val_loss = val_metrics["loss"]
+            reg_ece = val_metrics["ece"]
+            val_accuracy = None
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
         history["train_grad_norm"].append(train_grad_norm)
         history["ece"].append(reg_ece)
-        if train_accuracy is not None and val_accuracy is not None:
-            history.setdefault("train_accuracy", []).append(train_accuracy)
-            history.setdefault("val_accuracy", []).append(val_accuracy)
+        if task == "classification":
+            history["train_accuracy"].append(train_accuracy or 0.0)
+            history["val_accuracy"].append(val_accuracy or 0.0)
+            history["val_precision"].append(val_metrics["precision"])
+            history["val_recall"].append(val_metrics["recall"])
+            history["val_f1"].append(val_metrics["f1"])
+            history["val_brier"].append(val_metrics["brier"])
+            history["val_avg_confidence"].append(val_metrics["avg_confidence"])
+            history["val_confidence_correct"].append(val_metrics["confidence_correct"])
+            history["val_confidence_incorrect"].append(val_metrics["confidence_incorrect"])
         current_lr = float(optimizer.param_groups[0].get("lr", lr))
         history["learning_rate"].append(current_lr)
         msg = f"Epoch {epoch:3d} | train_loss={train_loss:.6f} | val_loss={val_loss:.6f} | ECE={reg_ece:.4f}"
-        if train_accuracy is not None and val_accuracy is not None:
+        if task == "classification":
             msg += f" | acc={val_accuracy:.3f}"
         print(msg)
 
@@ -484,7 +707,7 @@ def train_model(
             writer.add_scalar("loss/val", val_loss, epoch)
             writer.add_scalar("grad/mean_norm", train_grad_norm, epoch)
             writer.add_scalar("lr/learning_rate", current_lr, epoch)
-            if train_accuracy is not None and val_accuracy is not None:
+            if task == "classification":
                 writer.add_scalar("accuracy/train", train_accuracy, epoch)
                 writer.add_scalar("accuracy/val", val_accuracy, epoch)
 
@@ -496,7 +719,7 @@ def train_model(
                 "grad/mean_norm": train_grad_norm,
                 "lr": current_lr,
             }
-            if train_accuracy is not None and val_accuracy is not None:
+            if task == "classification":
                 log_data["accuracy/train"] = train_accuracy
                 log_data["accuracy/val"] = val_accuracy
             wandb.log(log_data)
@@ -530,14 +753,27 @@ def train_model(
                 )
                 break
 
+    training_time = time.perf_counter() - start_time
+    history["training_time"] = [training_time]
+    history["num_parameters"] = [sum(p.numel() for p in model.parameters())]
+
     if results_path:
-        collect_results(
-            model=model,
-            loader=val_loader,
-            device=device,
-            save_path=results_path,
-            history=history,
-        )
+        if task == "classification":
+            collect_classification_results(
+                model=model,
+                loader=val_loader,
+                device=device,
+                model_name=model_name,
+                save_path=results_path,
+            )
+        else:
+            collect_results(
+                model=model,
+                loader=val_loader,
+                device=device,
+                save_path=results_path,
+                history=history,
+            )
 
     return model, history
 
@@ -551,6 +787,12 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--val-ratio", type=float, default=0.2, help="Fraction of data to use for validation")
     parser.add_argument("--model", type=str, default="mlp", choices=["mlp", "deep", "rnn", "lstm", "residual"], help="Model type: 'mlp', 'deep', 'rnn', 'lstm', 'residual'")
+    parser.add_argument("--task", type=str, default="regression", choices=["regression", "classification"], help="Task type")
+    parser.add_argument("--train-path", type=str, default="data/finsen/processed/train.csv", help="Train split CSV (classification)")
+    parser.add_argument("--val-path", type=str, default="data/finsen/processed/val.csv", help="Validation split CSV (classification)")
+    parser.add_argument("--test-path", type=str, default="data/finsen/processed/test.csv", help="Test split CSV (classification)")
+    parser.add_argument("--max-features", type=int, default=2000, help="TF-IDF max features for MLP-like models")
+    parser.add_argument("--max-seq-len", type=int, default=128, help="Max sequence length for RNN/LSTM inputs")
     parser.add_argument("--split-seed", type=int, default=None, help="Random seed for train/val split")
     parser.add_argument("--dropout", type=float, default=0.0, help="Dropout probability")
     parser.add_argument("--mlp-hidden-sizes", type=str, default=None, help="Comma-separated hidden sizes for MLP (e.g. 128,64)")
@@ -591,6 +833,12 @@ def main() -> None:
         lr=args.lr,
         val_ratio=args.val_ratio,
         split_seed=args.split_seed,
+        task=args.task,
+        train_path=args.train_path,
+        val_path=args.val_path,
+        test_path=args.test_path,
+        max_features=args.max_features,
+        max_seq_len=args.max_seq_len,
         mlp_hidden_sizes=_parse_sizes(args.mlp_hidden_sizes),
         deep_hidden_sizes=_parse_sizes(args.deep_hidden_sizes),
         rnn_hidden_size=args.rnn_hidden_size,

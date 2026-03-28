@@ -18,6 +18,7 @@ from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
 import torch
+import torch.nn as nn
 
 # Ensure repo root is on sys.path when running this script directly.
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -32,7 +33,13 @@ except Exception:  # pragma: no cover - optional dependency
     optuna = None  # type: ignore
     OPTUNA_AVAILABLE = False
 
-from experiments.train import train_model
+from data.preprocessing.data_loaders import get_mlp_loaders, get_rnn_loaders
+from data.preprocessing.split_data import create_splits
+from experiments.train import (
+    collect_classification_results,
+    eval_epoch_classification,
+    train_model,
+)
 
 MODEL_ALIASES = {
     "mlp": "mlp",
@@ -72,6 +79,12 @@ class TrialConfig:
     val_ratio: float
     split_seed: int | None
     dropout: float
+    task: str
+    train_path: str
+    val_path: str
+    test_path: str
+    max_features: int
+    max_seq_len: int
     mlp_hidden_sizes: Tuple[int, ...] | None
     deep_hidden_sizes: Tuple[int, ...] | None
     rnn_hidden_size: int
@@ -91,6 +104,12 @@ class TrialConfig:
             "val_ratio": self.val_ratio,
             "split_seed": self.split_seed,
             "dropout": self.dropout,
+            "task": self.task,
+            "train_path": self.train_path,
+            "val_path": self.val_path,
+            "test_path": self.test_path,
+            "max_features": self.max_features,
+            "max_seq_len": self.max_seq_len,
             "mlp_hidden_sizes": list(self.mlp_hidden_sizes) if self.mlp_hidden_sizes else None,
             "deep_hidden_sizes": list(self.deep_hidden_sizes) if self.deep_hidden_sizes else None,
             "rnn_hidden_size": self.rnn_hidden_size,
@@ -127,6 +146,7 @@ def build_search_space(model: str) -> Dict[str, Iterable]:
         return {
             "hidden_size": [32, 64, 128, 256],
             "lr": lrs,
+            "seq_len": [10, 20, 30],
         }
     if model == "residual":
         return {
@@ -154,6 +174,7 @@ def grid_configs(
 def make_config(model: str, base: Dict[str, object], params: Dict[str, object]) -> TrialConfig:
     # Defaults for all models
     seq_len = int(params.get("seq_len", base["seq_len"]))
+    max_seq_len = int(params.get("seq_len", base["max_seq_len"]))
     lr = float(params.get("lr", base["lr"]))
     hidden_size = int(params.get("hidden_size", base["hidden_size"]))
     depth = int(params.get("depth", base["depth"]))
@@ -181,6 +202,12 @@ def make_config(model: str, base: Dict[str, object], params: Dict[str, object]) 
         val_ratio=float(base["val_ratio"]),
         split_seed=base["split_seed"],
         dropout=float(base["dropout"]),
+        task=str(base["task"]),
+        train_path=str(base["train_path"]),
+        val_path=str(base["val_path"]),
+        test_path=str(base["test_path"]),
+        max_features=int(base["max_features"]),
+        max_seq_len=max_seq_len,
         mlp_hidden_sizes=mlp_hidden_sizes,
         deep_hidden_sizes=deep_hidden_sizes,
         rnn_hidden_size=rnn_hidden_size,
@@ -209,6 +236,24 @@ def summarize_history(history: Dict[str, List[float]]) -> Dict[str, float]:
         result["final_val_accuracy"] = float(history["val_accuracy"][-1])
     if history.get("train_accuracy"):
         result["final_train_accuracy"] = float(history["train_accuracy"][-1])
+    if history.get("val_precision"):
+        result["final_val_precision"] = float(history["val_precision"][-1])
+    if history.get("val_recall"):
+        result["final_val_recall"] = float(history["val_recall"][-1])
+    if history.get("val_f1"):
+        result["final_val_f1"] = float(history["val_f1"][-1])
+    if history.get("val_brier"):
+        result["final_val_brier"] = float(history["val_brier"][-1])
+    if history.get("val_avg_confidence"):
+        result["final_val_avg_confidence"] = float(history["val_avg_confidence"][-1])
+    if history.get("val_confidence_correct"):
+        result["final_val_confidence_correct"] = float(history["val_confidence_correct"][-1])
+    if history.get("val_confidence_incorrect"):
+        result["final_val_confidence_incorrect"] = float(history["val_confidence_incorrect"][-1])
+    if history.get("training_time"):
+        result["training_time"] = float(history["training_time"][-1])
+    if history.get("num_parameters"):
+        result["num_parameters"] = float(history["num_parameters"][-1])
     return result
 
 
@@ -236,6 +281,12 @@ def run_trial(
         lr=cfg.lr,
         val_ratio=cfg.val_ratio,
         split_seed=cfg.split_seed,
+        task=cfg.task,
+        train_path=cfg.train_path,
+        val_path=cfg.val_path,
+        test_path=cfg.test_path,
+        max_features=cfg.max_features,
+        max_seq_len=cfg.max_seq_len,
         mlp_hidden_sizes=cfg.mlp_hidden_sizes,
         deep_hidden_sizes=cfg.deep_hidden_sizes,
         rnn_hidden_size=cfg.rnn_hidden_size,
@@ -264,6 +315,96 @@ def run_trial(
         **summary,
     }
     return record
+
+
+def evaluate_best_on_test(
+    cfg: TrialConfig,
+    data_path: str,
+    output_dir: str,
+    early_stopping_patience: int,
+    log_backend: str,
+    log_dir: str,
+    wandb_project: str | None,
+) -> Dict[str, float]:
+    """Train best config and evaluate on held-out test set."""
+    os.makedirs(output_dir, exist_ok=True)
+    checkpoint_path = os.path.join(output_dir, "best_checkpoint.pt")
+    val_results_path = os.path.join(output_dir, "val_results.npz")
+    test_results_path = os.path.join(output_dir, "test_results.npz")
+
+    model, _ = train_model(
+        model_name=cfg.model,
+        data_path=data_path,
+        seq_len=cfg.seq_len,
+        batch_size=cfg.batch_size,
+        epochs=cfg.epochs,
+        lr=cfg.lr,
+        val_ratio=cfg.val_ratio,
+        split_seed=cfg.split_seed,
+        task=cfg.task,
+        train_path=cfg.train_path,
+        val_path=cfg.val_path,
+        test_path=cfg.test_path,
+        max_features=cfg.max_features,
+        max_seq_len=cfg.max_seq_len,
+        mlp_hidden_sizes=cfg.mlp_hidden_sizes,
+        deep_hidden_sizes=cfg.deep_hidden_sizes,
+        rnn_hidden_size=cfg.rnn_hidden_size,
+        rnn_num_layers=cfg.rnn_num_layers,
+        lstm_hidden_size=cfg.lstm_hidden_size,
+        lstm_num_layers=cfg.lstm_num_layers,
+        residual_hidden_size=cfg.residual_hidden_size,
+        residual_num_blocks=cfg.residual_num_blocks,
+        dropout=cfg.dropout,
+        checkpoint_path=checkpoint_path,
+        resume=False,
+        early_stopping_patience=early_stopping_patience,
+        log_backend=log_backend,
+        log_dir=log_dir,
+        wandb_project=wandb_project,
+        wandb_run_name=f"{cfg.model}_best",
+        results_path=val_results_path,
+    )
+
+    if cfg.model in ("rnn", "lstm"):
+        _, _, test_loader = get_rnn_loaders(
+            train_path=cfg.train_path,
+            val_path=cfg.val_path,
+            test_path=cfg.test_path,
+            batch_size=cfg.batch_size,
+            max_seq_len=cfg.max_seq_len,
+        )
+    else:
+        _, _, test_loader = get_mlp_loaders(
+            train_path=cfg.train_path,
+            val_path=cfg.val_path,
+            test_path=cfg.test_path,
+            batch_size=cfg.batch_size,
+            max_features=cfg.max_features,
+        )
+
+    device = next(model.parameters()).device
+    loss_fn = nn.CrossEntropyLoss()
+    test_metrics = eval_epoch_classification(model, test_loader, loss_fn, device, cfg.model)
+    collect_classification_results(
+        model=model,
+        loader=test_loader,
+        device=device,
+        model_name=cfg.model,
+        save_path=test_results_path,
+    )
+
+    return {
+        "test_accuracy": float(test_metrics["accuracy"]),
+        "test_ece": float(test_metrics["ece"]),
+        "test_f1_score": float(test_metrics["f1"]),
+        "test_precision": float(test_metrics["precision"]),
+        "test_recall": float(test_metrics["recall"]),
+        "test_brier_score": float(test_metrics["brier"]),
+        "test_avg_confidence": float(test_metrics["avg_confidence"]),
+        "test_confidence_correct": float(test_metrics["confidence_correct"]),
+        "test_confidence_incorrect": float(test_metrics["confidence_incorrect"]),
+    }
 
 
 def _format_lr(lr: float) -> str:
@@ -319,6 +460,7 @@ def _run_slug_from_record(record: Dict[str, object], model: str) -> str:
 
 def _read_csv_records(path: str) -> List[Dict[str, object]]:
     records: List[Dict[str, object]] = []
+    trial_map: Dict[int, TrialConfig] = {}
     with open(path, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -348,6 +490,8 @@ def _coerce_types(record: Dict[str, object]) -> Dict[str, object]:
         "lstm_num_layers",
         "residual_num_blocks",
         "best_epoch",
+        "max_features",
+        "max_seq_len",
     }
     float_fields = {
         "lr",
@@ -359,6 +503,24 @@ def _coerce_types(record: Dict[str, object]) -> Dict[str, object]:
         "final_ece",
         "final_val_accuracy",
         "final_train_accuracy",
+        "final_val_precision",
+        "final_val_recall",
+        "final_val_f1",
+        "final_val_brier",
+        "final_val_avg_confidence",
+        "final_val_confidence_correct",
+        "final_val_confidence_incorrect",
+        "training_time",
+        "num_parameters",
+        "test_accuracy",
+        "test_ece",
+        "test_f1_score",
+        "test_precision",
+        "test_recall",
+        "test_brier_score",
+        "test_avg_confidence",
+        "test_confidence_correct",
+        "test_confidence_incorrect",
     }
     list_fields = {"mlp_hidden_sizes", "deep_hidden_sizes"}
 
@@ -456,7 +618,64 @@ def ingest_results(
 def save_results(records: List[Dict[str, object]], out_csv: str, out_jsonl: str) -> None:
     if not records:
         return
-    fieldnames = list(records[0].keys())
+    preferred_order = [
+        "trial_id",
+        "run_name",
+        "run_dir",
+        "model",
+        "task",
+        "seq_len",
+        "lr",
+        "batch_size",
+        "epochs",
+        "val_ratio",
+        "split_seed",
+        "dropout",
+        "train_path",
+        "val_path",
+        "test_path",
+        "max_features",
+        "max_seq_len",
+        "mlp_hidden_sizes",
+        "deep_hidden_sizes",
+        "rnn_hidden_size",
+        "rnn_num_layers",
+        "lstm_hidden_size",
+        "lstm_num_layers",
+        "residual_hidden_size",
+        "residual_num_blocks",
+        "best_val_loss",
+        "best_epoch",
+        "final_val_loss",
+        "final_train_loss",
+        "final_ece",
+        "final_val_accuracy",
+        "final_train_accuracy",
+        "final_val_precision",
+        "final_val_recall",
+        "final_val_f1",
+        "final_val_brier",
+        "final_val_avg_confidence",
+        "final_val_confidence_correct",
+        "final_val_confidence_incorrect",
+        "training_time",
+        "num_parameters",
+        "test_accuracy",
+        "test_ece",
+        "test_f1_score",
+        "test_precision",
+        "test_recall",
+        "test_brier_score",
+        "test_avg_confidence",
+        "test_confidence_correct",
+        "test_confidence_incorrect",
+    ]
+    field_set = set()
+    for rec in records:
+        field_set.update(rec.keys())
+    fieldnames = [f for f in preferred_order if f in field_set] + [
+        f for f in sorted(field_set) if f not in preferred_order
+    ]
     os.makedirs(os.path.dirname(out_csv), exist_ok=True)
     with open(out_csv, "w", encoding="utf-8") as f:
         f.write(",".join(fieldnames) + "\n")
@@ -498,6 +717,13 @@ def main() -> None:
     parser.add_argument("--val-ratio", type=float, default=0.2)
     parser.add_argument("--split-seed", type=int, default=42)
     parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--task", type=str, default="classification", choices=["classification", "regression"])
+    parser.add_argument("--train-path", type=str, default="data/finsen/processed/train.csv")
+    parser.add_argument("--val-path", type=str, default="data/finsen/processed/val.csv")
+    parser.add_argument("--test-path", type=str, default="data/finsen/processed/test.csv")
+    parser.add_argument("--input-csv", type=str, default="data/finsen/raw/FinSen_US_Categorized.csv")
+    parser.add_argument("--max-features", type=int, default=2000)
+    parser.add_argument("--max-seq-len", type=int, default=128)
     parser.add_argument("--rnn-num-layers", type=int, default=1)
     parser.add_argument("--lstm-num-layers", type=int, default=1)
     parser.add_argument("--residual-num-blocks", type=int, default=3)
@@ -544,6 +770,18 @@ def main() -> None:
         print(f"Ingested tuning results into: {model_dir}")
         return
 
+    if args.task == "classification":
+        if not (os.path.exists(args.train_path) and os.path.exists(args.val_path) and os.path.exists(args.test_path)):
+            print("Train/val/test splits not found. Creating new 70/15/15 split...")
+            create_splits(
+                input_csv=args.input_csv,
+                output_dir=os.path.dirname(args.train_path),
+                train_size=0.7,
+                val_size=0.15,
+                test_size=0.15,
+                random_state=args.split_seed,
+            )
+
     base = {
         "seq_len": args.seq_len,
         "lr": args.lr,
@@ -552,6 +790,12 @@ def main() -> None:
         "val_ratio": args.val_ratio,
         "split_seed": args.split_seed,
         "dropout": args.dropout,
+        "task": args.task,
+        "train_path": args.train_path,
+        "val_path": args.val_path,
+        "test_path": args.test_path,
+        "max_features": args.max_features,
+        "max_seq_len": args.max_seq_len,
         "rnn_num_layers": args.rnn_num_layers,
         "lstm_num_layers": args.lstm_num_layers,
         "residual_num_blocks": args.residual_num_blocks,
@@ -579,6 +823,7 @@ def main() -> None:
                 wandb_project=args.wandb_project,
             )
             records.append(rec)
+            trial_map[idx] = cfg
     elif args.method == "random":
         configs = grid_configs(model_key, base)
         random.shuffle(configs)
@@ -598,6 +843,7 @@ def main() -> None:
                 wandb_project=args.wandb_project,
             )
             records.append(rec)
+            trial_map[idx] = cfg
     else:
         if not OPTUNA_AVAILABLE:
             raise RuntimeError("Optuna is not available. Install optuna or choose grid/random.")
@@ -628,10 +874,28 @@ def main() -> None:
                 wandb_project=args.wandb_project,
             )
             records.append(rec)
+            trial_map[trial.number + 1] = cfg
             return float(rec["best_val_loss"])
 
         study = optuna.create_study(direction="minimize")
         study.optimize(objective, n_trials=args.n_trials)
+
+    if records and args.task == "classification":
+        best = min(records, key=lambda r: float(r["best_val_loss"]))
+        best_trial_id = int(best.get("trial_id") or 0)
+        best_cfg = trial_map.get(best_trial_id)
+        if best_cfg is not None:
+            best_output_dir = os.path.join(model_dir, "best_model")
+            test_metrics = evaluate_best_on_test(
+                cfg=best_cfg,
+                data_path=args.data_path,
+                output_dir=best_output_dir,
+                early_stopping_patience=args.early_stopping_patience,
+                log_backend=args.log_backend,
+                log_dir=args.log_dir,
+                wandb_project=args.wandb_project,
+            )
+            best.update(test_metrics)
 
     out_csv = os.path.join(model_dir, "results.csv")
     out_jsonl = os.path.join(model_dir, "results.jsonl")

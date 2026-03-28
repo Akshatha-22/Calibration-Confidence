@@ -69,18 +69,16 @@ We use the **FinSen dataset**, which integrates:
 ├── setup.py
 └── README.md
 
-text
-
- 🚀 Getting Started
- Prerequisites
+## 🚀 Getting Started
+### Prerequisites
 
 ```bash
 pip install -r requirements.txt
+```
 
+### Quick Start
 
-Quick Start
-
-python
+```bash
 # Clone the FinSen dataset
 git clone https://github.com/EagleAdelaide/FinSen_Dataset.git
 
@@ -89,30 +87,34 @@ python experiments/train.py --dataset finsen --all_models
 
 # Compute calibration metrics
 python calibration/ece.py --results_dir ./results
-📊 Key Metrics
-Metric	Description
-ECE	Expected Calibration Error = |confidence - accuracy|
-Reliability Diagram	Visual plot of confidence vs. accuracy
-Gradient Norm	‖∇W‖ tracks training stability
-Failure Time	First timestep where ECE > threshold (e.g., 0.20)
-Gradient-ECE Correlation	How well gradients predict calibration failure
+```
+
+## 📊 Key Metrics
+| Metric | Description |
+|--------|-------------|
+| ECE | Expected Calibration Error = \|confidence - accuracy\| |
+| Reliability Diagram | Visual plot of confidence vs. accuracy |
+| Gradient Norm | ‖∇W‖ tracks training stability |
+| Failure Time | First timestep where ECE > threshold (e.g., 0.20) |
+| Gradient-ECE Correlation | How well gradients predict calibration failure |
 
 
-📈 Expected Results
+## 📈 Expected Results
 Based on our theoretical analysis, we expect:
 
-Model	Failure Time	Predictability	Pattern
-MLP	Never	N/A	Flat ECE
-Deep MLP	Never	N/A	Slightly higher flat ECE
-Vanilla RNN	Early (t≈25)	High (r>0.8)	Exponential rise
-LSTM	Late (t≈75)	Low (r<0.4)	Sudden jump
-Residual MLP	Variable	Medium	Chaotic
+| Model | Failure Time | Predictability | Pattern |
+|-------|--------------|----------------|---------|
+| MLP | Never | N/A | Flat ECE |
+| Deep MLP | Never | N/A | Slightly higher flat ECE |
+| Vanilla RNN | Early (t≈25) | High (r>0.8) | Exponential rise |
+| LSTM | Late (t≈75) | Low (r<0.4) | Sudden jump |
+| Residual MLP | Variable | Medium | Chaotic |
 
 
-📝 Citation
+## 📝 Citation
 If you use this code or the FinSen dataset for your research, please cite:
 
-bibtex
+```bibtex
 @misc{calibration2025,
   author = {Your Team Name},
   title = {AI Confidence Calibration Failure Detection in Financial Time Series},
@@ -127,26 +129,28 @@ bibtex
   year={2024},
   url={https://github.com/EagleAdelaide/FinSen_Dataset}
 }
+```
 
+## 👥 Team
+| Member | Role | Responsibilities |
+|--------|------|------------------|
+| Member 1 | Team Lead | Architecture, integration |
+| Member 2 | Model Implementer 1 | MLP, Deep MLP, Residual MLP |
+| Member 3 | Model Implementer 2 | RNN, LSTM |
+| Member 4 | Calibration Lead | ECE, visualization, analysis |
+| Member 5 | Experiment Runner | Training, tuning, results |
 
-👥 Team
-Member	Role	Responsibilities
-Member 1	Team Lead	Architecture, integration
-Member 2	Model Implementer 1	MLP, Deep MLP, Residual MLP
-Member 3	Model Implementer 2	RNN, LSTM
-Member 4	Calibration Lead	ECE, visualization, analysis
-Member 5	Experiment Runner	Training, tuning, results
-📄 License
+## 📄 License
 This project is licensed under the MIT License - see the LICENSE file for details.
 
-🙏 Acknowledgments
-Eagle Adelaide Research for the FinSen dataset
+## 🙏 Acknowledgments
+- Eagle Adelaide Research for the FinSen dataset
 
-Kaggle for hosting related competitions
+- Kaggle for hosting related competitions
 
-Our academic advisors and reviewers
+- Our academic advisors and reviewers
 
-⭐ Star History
+## ⭐ Star History
 If you find this project useful, please consider giving it a star! It helps others discover our work.
 
 # Project Coding Standards

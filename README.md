@@ -32,6 +32,28 @@ We compare **five architectures** on the same financial time series data:
 3. **Can gradient norms predict impending calibration failure**?
 4. **Do different architectures have different "failure signatures"**?
 
+## Why These Choices
+
+**Why 70/15/15 splits?**  
+We use 70% train / 15% validation / 15% test to balance learning capacity with robust evaluation. The validation set is large enough for stable early-stopping and model selection, while the test set remains sizable for reliable final reporting.
+
+**Why a hold-out test set?**  
+The test set is never used during training or hyperparameter tuning. It provides an unbiased estimate of real-world performance after all decisions are finalized.
+
+**Why these metrics (ECE, Brier, confidence stats)?**  
+Accuracy alone can hide calibration failures.  
+ECE measures the gap between confidence and correctness.  
+Brier score captures probabilistic quality (lower is better).  
+Average confidence and confidence on correct/incorrect predictions show whether the model is over-confident or under-confident in practice.
+
+**Why these model families?**  
+We compare five architectures to cover distinct inductive biases:  
+MLP: a simple baseline with no temporal memory.  
+Deep MLP: tests the effect of depth on calibration.  
+Vanilla RNN: simple recurrence with clear gradient behavior.  
+LSTM: gated recurrence to handle longer dependencies.  
+Residual MLP: skip connections to stabilize deeper feedforward models.
+
 ## 💾 Dataset: FinSen
 
 We use the **FinSen dataset**, which integrates:

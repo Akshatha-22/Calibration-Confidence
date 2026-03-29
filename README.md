@@ -209,6 +209,7 @@ If you find this project useful, please consider giving it a star! It helps othe
 - First line <50 chars, then blank line, then details
 
 ## 8. Tools We Use
-- Formatting: Black
-- Linting: Flake8
-- Type checking: mypy (optional)
+- Core libraries (from requirements.txt): PyTorch, NumPy, pandas, Matplotlib, scikit-learn, SciPy
+- Notebooks: Jupyter, Google Colab
+- Hyperparameter tuning: Optuna
+- Optional experiment logging: TensorBoard, Weights & Biases (wandb)

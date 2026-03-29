@@ -225,12 +225,20 @@ def summarize_history(history: Dict[str, List[float]]) -> Dict[str, float]:
     final_val_loss = float(history["val_loss"][-1]) if history["val_loss"] else float("inf")
     final_ece = float(history["ece"][-1]) if history.get("ece") else float("nan")
     final_train_loss = float(history["train_loss"][-1]) if history["train_loss"] else float("inf")
+    final_grad_norm = (
+        float(history["train_grad_norm"][-1]) if history.get("train_grad_norm") else float("nan")
+    )
+    final_rmse = float(history.get("val_rmse", [float("nan")])[-1])
+    final_r2 = float(history.get("val_r2", [float("nan")])[-1])
     result = {
         "best_val_loss": best_val_loss,
         "best_epoch": best_epoch,
         "final_val_loss": final_val_loss,
         "final_train_loss": final_train_loss,
         "final_ece": final_ece,
+        "final_grad_norm": final_grad_norm,
+        "final_rmse": final_rmse,
+        "final_r2": final_r2,
     }
     if history.get("val_accuracy"):
         result["final_val_accuracy"] = float(history["val_accuracy"][-1])
@@ -307,12 +315,28 @@ def run_trial(
     )
 
     summary = summarize_history(history)
+    hidden_size = cfg.rnn_hidden_size
+    if cfg.model == "deep" and cfg.deep_hidden_sizes:
+        hidden_size = cfg.deep_hidden_sizes[0]
+    elif cfg.model == "mlp" and cfg.mlp_hidden_sizes:
+        hidden_size = cfg.mlp_hidden_sizes[0]
+    elif cfg.model == "lstm":
+        hidden_size = cfg.lstm_hidden_size
+    elif cfg.model == "residual":
+        hidden_size = cfg.residual_hidden_size
     record: Dict[str, object] = {
         "trial_id": trial_id,
         "run_name": run_name,
         "run_dir": run_dir,
         **cfg.to_dict(),
         **summary,
+        "learning_rate": cfg.lr,
+        "hidden_size": hidden_size,
+        "ECE": summary.get("final_ece"),
+        "RMSE": summary.get("final_rmse"),
+        "R2": summary.get("final_r2"),
+        "grad_norm": summary.get("final_grad_norm"),
+        "timestep": cfg.seq_len,
     }
     return record
 
@@ -492,15 +516,25 @@ def _coerce_types(record: Dict[str, object]) -> Dict[str, object]:
         "best_epoch",
         "max_features",
         "max_seq_len",
+        "hidden_size",
+        "timestep",
     }
     float_fields = {
         "lr",
+        "learning_rate",
         "val_ratio",
         "dropout",
         "best_val_loss",
         "final_val_loss",
         "final_train_loss",
         "final_ece",
+        "final_grad_norm",
+        "final_rmse",
+        "final_r2",
+        "ECE",
+        "RMSE",
+        "R2",
+        "grad_norm",
         "final_val_accuracy",
         "final_train_accuracy",
         "final_val_precision",
@@ -623,6 +657,13 @@ def save_results(records: List[Dict[str, object]], out_csv: str, out_jsonl: str)
         "run_name",
         "run_dir",
         "model",
+        "learning_rate",
+        "hidden_size",
+        "ECE",
+        "RMSE",
+        "R2",
+        "grad_norm",
+        "timestep",
         "task",
         "seq_len",
         "lr",
@@ -649,6 +690,9 @@ def save_results(records: List[Dict[str, object]], out_csv: str, out_jsonl: str)
         "final_val_loss",
         "final_train_loss",
         "final_ece",
+        "final_grad_norm",
+        "final_rmse",
+        "final_r2",
         "final_val_accuracy",
         "final_train_accuracy",
         "final_val_precision",

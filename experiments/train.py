@@ -268,9 +268,17 @@ def eval_epoch_regression(
     preds_arr = np.concatenate(all_preds, axis=0)
     targets_arr = np.concatenate(all_targets, axis=0)
     reg_ece = regression_calibration_error(preds_arr, targets_arr, n_bins=n_bins)
+    mse = float(np.mean((preds_arr - targets_arr) ** 2)) if n > 0 else float("nan")
+    rmse = float(np.sqrt(mse)) if np.isfinite(mse) else float("nan")
+    targets_mean = float(np.mean(targets_arr)) if n > 0 else float("nan")
+    ss_res = float(np.sum((preds_arr - targets_arr) ** 2)) if n > 0 else float("nan")
+    ss_tot = float(np.sum((targets_arr - targets_mean) ** 2)) if n > 0 else float("nan")
+    r2 = float("nan") if ss_tot == 0.0 else float(1.0 - (ss_res / ss_tot))
     return {
         "loss": float(val_loss),
         "ece": float(reg_ece),
+        "rmse": rmse,
+        "r2": r2,
     }
 
 
@@ -591,6 +599,8 @@ def train_model(
         "train_grad_norm": [],
         "ece": [],
         "learning_rate": [],
+        "val_rmse": [],
+        "val_r2": [],
     }
     if task == "classification":
         history.update(
@@ -680,6 +690,8 @@ def train_model(
             val_loss = val_metrics["loss"]
             reg_ece = val_metrics["ece"]
             val_accuracy = None
+            history["val_rmse"].append(val_metrics.get("rmse", float("nan")))
+            history["val_r2"].append(val_metrics.get("r2", float("nan")))
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
         history["train_grad_norm"].append(train_grad_norm)
@@ -694,6 +706,11 @@ def train_model(
             history["val_avg_confidence"].append(val_metrics["avg_confidence"])
             history["val_confidence_correct"].append(val_metrics["confidence_correct"])
             history["val_confidence_incorrect"].append(val_metrics["confidence_incorrect"])
+        else:
+            if len(history["val_rmse"]) < len(history["train_loss"]):
+                history["val_rmse"].append(float("nan"))
+            if len(history["val_r2"]) < len(history["train_loss"]):
+                history["val_r2"].append(float("nan"))
         current_lr = float(optimizer.param_groups[0].get("lr", lr))
         history["learning_rate"].append(current_lr)
         msg = f"Epoch {epoch:3d} | train_loss={train_loss:.6f} | val_loss={val_loss:.6f} | ECE={reg_ece:.4f}"

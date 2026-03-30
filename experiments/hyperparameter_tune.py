@@ -13,6 +13,7 @@ import json
 import os
 import random
 import sys
+from datetime import datetime
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Tuple
 
@@ -40,6 +41,11 @@ from experiments.train import (
     eval_epoch_classification,
     train_model,
 )
+from models.deep_mlp import build_deep_mlp
+from models.lstm import build_lstm
+from models.mlp import build_mlp
+from models.residual_mlp import build_residual_mlp
+from models.vanilla_rnn import build_vanilla_rnn
 
 MODEL_ALIASES = {
     "mlp": "mlp",
@@ -220,16 +226,19 @@ def make_config(model: str, base: Dict[str, object], params: Dict[str, object]) 
 
 
 def summarize_history(history: Dict[str, List[float]]) -> Dict[str, float]:
+    def _last_or(values: List[float] | None, default: float) -> float:
+        if values:
+            return float(values[-1])
+        return default
+
     best_val_loss = float(np.min(history["val_loss"])) if history["val_loss"] else float("inf")
     best_epoch = int(np.argmin(history["val_loss"])) + 1 if history["val_loss"] else -1
     final_val_loss = float(history["val_loss"][-1]) if history["val_loss"] else float("inf")
-    final_ece = float(history["ece"][-1]) if history.get("ece") else float("nan")
+    final_ece = float(history["ece"][-1]) if history.get("ece") else 0.0
     final_train_loss = float(history["train_loss"][-1]) if history["train_loss"] else float("inf")
-    final_grad_norm = (
-        float(history["train_grad_norm"][-1]) if history.get("train_grad_norm") else float("nan")
-    )
-    final_rmse = float(history.get("val_rmse", [float("nan")])[-1])
-    final_r2 = float(history.get("val_r2", [float("nan")])[-1])
+    final_grad_norm = float(history["train_grad_norm"][-1]) if history.get("train_grad_norm") else 0.0
+    final_rmse = _last_or(history.get("val_rmse"), 0.0)
+    final_r2 = _last_or(history.get("val_r2"), 0.0)
     result = {
         "best_val_loss": best_val_loss,
         "best_epoch": best_epoch,
@@ -421,6 +430,8 @@ def evaluate_best_on_test(
     return {
         "test_accuracy": float(test_metrics["accuracy"]),
         "test_ece": float(test_metrics["ece"]),
+        "test_rmse": float(test_metrics["rmse"]),
+        "test_r2": float(test_metrics["r2"]),
         "test_f1_score": float(test_metrics["f1"]),
         "test_precision": float(test_metrics["precision"]),
         "test_recall": float(test_metrics["recall"]),
@@ -484,7 +495,6 @@ def _run_slug_from_record(record: Dict[str, object], model: str) -> str:
 
 def _read_csv_records(path: str) -> List[Dict[str, object]]:
     records: List[Dict[str, object]] = []
-    trial_map: Dict[int, TrialConfig] = {}
     with open(path, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -548,6 +558,8 @@ def _coerce_types(record: Dict[str, object]) -> Dict[str, object]:
         "num_parameters",
         "test_accuracy",
         "test_ece",
+        "test_rmse",
+        "test_r2",
         "test_f1_score",
         "test_precision",
         "test_recall",
@@ -576,6 +588,247 @@ def _coerce_types(record: Dict[str, object]) -> Dict[str, object]:
             continue
         coerced[key] = value
     return coerced
+
+
+def _compute_rmse_r2(preds: np.ndarray, targets: np.ndarray) -> tuple[float, float]:
+    preds_arr = np.asarray(preds, dtype=np.float64)
+    targets_arr = np.asarray(targets, dtype=np.float64)
+    if preds_arr.size == 0 or targets_arr.size == 0:
+        return 0.0, 0.0
+
+    squared_error = (preds_arr - targets_arr) ** 2
+    mse = float(np.mean(squared_error)) if squared_error.size > 0 else 0.0
+    rmse = float(np.sqrt(mse)) if np.isfinite(mse) else 0.0
+    targets_mean = float(np.mean(targets_arr))
+    ss_res = float(np.sum(squared_error))
+    ss_tot = float(np.sum((targets_arr - targets_mean) ** 2))
+    if not np.isfinite(ss_tot) or ss_tot == 0.0:
+        return rmse, 1.0 if ss_res == 0.0 else 0.0
+    return rmse, float(1.0 - (ss_res / ss_tot))
+
+
+def _is_missing_metric(value: object) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        raw = value.strip().lower()
+        return raw in ("", "none", "nan")
+    if isinstance(value, (int, float, np.floating)):
+        return bool(np.isnan(value))
+    return False
+
+
+def _sanitize_value(value: object) -> object:
+    if isinstance(value, list):
+        return [_sanitize_value(v) for v in value]
+    if isinstance(value, (float, np.floating)):
+        return float(value) if np.isfinite(value) else 0.0
+    return value
+
+
+def _sanitize_record(record: Dict[str, object]) -> Dict[str, object]:
+    return {key: _sanitize_value(value) for key, value in record.items()}
+
+
+def _config_from_record(record: Dict[str, object]) -> TrialConfig:
+    return TrialConfig(
+        model=str(record["model"]),
+        seq_len=int(record["seq_len"]),
+        lr=float(record["lr"]),
+        batch_size=int(record["batch_size"]),
+        epochs=int(record["epochs"]),
+        val_ratio=float(record["val_ratio"]),
+        split_seed=int(record["split_seed"]) if record.get("split_seed") is not None else None,
+        dropout=float(record.get("dropout", 0.0) or 0.0),
+        task=str(record.get("task", "classification")),
+        train_path=str(record.get("train_path", "data/finsen/processed/train.csv")),
+        val_path=str(record.get("val_path", "data/finsen/processed/val.csv")),
+        test_path=str(record.get("test_path", "data/finsen/processed/test.csv")),
+        max_features=int(record.get("max_features", 2000) or 2000),
+        max_seq_len=int(record.get("max_seq_len", 128) or 128),
+        mlp_hidden_sizes=tuple(_parse_list_field(record.get("mlp_hidden_sizes")) or []) or None,
+        deep_hidden_sizes=tuple(_parse_list_field(record.get("deep_hidden_sizes")) or []) or None,
+        rnn_hidden_size=int(record.get("rnn_hidden_size", 128) or 128),
+        rnn_num_layers=int(record.get("rnn_num_layers", 1) or 1),
+        lstm_hidden_size=int(record.get("lstm_hidden_size", 128) or 128),
+        lstm_num_layers=int(record.get("lstm_num_layers", 1) or 1),
+        residual_hidden_size=int(record.get("residual_hidden_size", 128) or 128),
+        residual_num_blocks=int(record.get("residual_num_blocks", 3) or 3),
+    )
+
+
+def _record_task(record: Dict[str, object]) -> str:
+    return str(record.get("task") or "classification")
+
+
+def _build_model_for_checkpoint(
+    cfg: TrialConfig,
+    device: torch.device,
+) -> tuple[torch.nn.Module, object]:
+    if cfg.model in ("rnn", "lstm"):
+        train_loader, _, test_loader = get_rnn_loaders(
+            train_path=cfg.train_path,
+            val_path=cfg.val_path,
+            test_path=cfg.test_path,
+            batch_size=cfg.batch_size,
+            max_seq_len=cfg.max_seq_len,
+        )
+        sample_batch = next(iter(train_loader))[0]
+        num_features = int(sample_batch.shape[-1])
+    else:
+        train_loader, _, test_loader = get_mlp_loaders(
+            train_path=cfg.train_path,
+            val_path=cfg.val_path,
+            test_path=cfg.test_path,
+            batch_size=cfg.batch_size,
+            max_features=cfg.max_features,
+        )
+        sample_batch = next(iter(train_loader))[0]
+        num_features = int(sample_batch.shape[-1])
+
+    train_labels = getattr(train_loader.dataset, "labels", None)
+    if train_labels is None or len(train_labels) == 0:
+        raise ValueError("Could not infer classification output size from training labels.")
+    output_size = int(len(set(int(label) for label in train_labels)))
+
+    if cfg.model == "deep":
+        model = build_deep_mlp(
+            seq_len=1,
+            num_features=num_features,
+            hidden_sizes=cfg.deep_hidden_sizes or (256, 128, 64, 32),
+            dropout=cfg.dropout,
+            output_size=output_size,
+        ).to(device)
+    elif cfg.model == "rnn":
+        model = build_vanilla_rnn(
+            seq_len=cfg.seq_len,
+            num_features=num_features,
+            hidden_size=cfg.rnn_hidden_size,
+            num_layers=cfg.rnn_num_layers,
+            dropout=cfg.dropout,
+            output_size=output_size,
+        ).to(device)
+    elif cfg.model == "lstm":
+        model = build_lstm(
+            seq_len=cfg.seq_len,
+            num_features=num_features,
+            hidden_size=cfg.lstm_hidden_size,
+            num_layers=cfg.lstm_num_layers,
+            dropout=cfg.dropout,
+            output_size=output_size,
+        ).to(device)
+    elif cfg.model == "residual":
+        model = build_residual_mlp(
+            seq_len=1,
+            num_features=num_features,
+            hidden_size=cfg.residual_hidden_size,
+            num_blocks=cfg.residual_num_blocks,
+            dropout=cfg.dropout,
+            output_size=output_size,
+        ).to(device)
+    else:
+        model = build_mlp(
+            seq_len=1,
+            num_features=num_features,
+            hidden_sizes=cfg.mlp_hidden_sizes or (128, 64),
+            dropout=cfg.dropout,
+            output_size=output_size,
+        ).to(device)
+
+    return model, test_loader
+
+
+def _evaluate_checkpoint_on_test(record: Dict[str, object]) -> Dict[str, float]:
+    cfg = _config_from_record(record)
+    checkpoint_path = os.path.join(str(record["run_dir"]), "checkpoint.pt")
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Missing checkpoint for run: {checkpoint_path}")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model, test_loader = _build_model_for_checkpoint(cfg, device)
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    try:
+        model.load_state_dict(ckpt["model_state_dict"])
+    except RuntimeError as exc:  # size mismatches or arch drift
+        print(f"Warning: skipping test backfill for {checkpoint_path} ({exc})")
+        return {}
+    model.eval()
+
+    loss_fn = nn.CrossEntropyLoss()
+    test_metrics = eval_epoch_classification(model, test_loader, loss_fn, device, cfg.model)
+    collect_classification_results(
+        model=model,
+        loader=test_loader,
+        device=device,
+        model_name=cfg.model,
+        save_path=os.path.join(str(record["run_dir"]), "test_results.npz"),
+    )
+    return {
+        "test_accuracy": float(test_metrics["accuracy"]),
+        "test_ece": float(test_metrics["ece"]),
+        "test_rmse": float(test_metrics["rmse"]),
+        "test_r2": float(test_metrics["r2"]),
+        "test_f1_score": float(test_metrics["f1"]),
+        "test_precision": float(test_metrics["precision"]),
+        "test_recall": float(test_metrics["recall"]),
+        "test_brier_score": float(test_metrics["brier"]),
+        "test_avg_confidence": float(test_metrics["avg_confidence"]),
+        "test_confidence_correct": float(test_metrics["confidence_correct"]),
+        "test_confidence_incorrect": float(test_metrics["confidence_incorrect"]),
+    }
+
+
+def backfill_missing_summary_metrics(records: List[Dict[str, object]]) -> None:
+    for record in records:
+        if not any(
+            _is_missing_metric(record.get(key))
+            for key in ("final_rmse", "final_r2", "RMSE", "R2")
+        ):
+            continue
+
+        results_path = os.path.join(str(record["run_dir"]), "results.npz")
+        if not os.path.exists(results_path):
+            continue
+        with np.load(results_path, allow_pickle=True) as results:
+            if "pred_labels" in results:
+                preds = results["pred_labels"]
+            elif "probs" in results:
+                preds = np.argmax(results["probs"], axis=1)
+            elif "logits" in results:
+                preds = np.argmax(results["logits"], axis=1)
+            elif "predictions" in results:
+                preds = results["predictions"]
+            else:
+                continue
+            targets = results["targets"]
+
+        rmse, r2 = _compute_rmse_r2(preds, targets)
+        record["final_rmse"] = rmse
+        record["final_r2"] = r2
+        record["RMSE"] = rmse
+        record["R2"] = r2
+
+
+def backfill_missing_test_metrics(records: List[Dict[str, object]]) -> None:
+    test_keys = (
+        "test_accuracy",
+        "test_ece",
+        "test_rmse",
+        "test_r2",
+        "test_f1_score",
+        "test_precision",
+        "test_recall",
+        "test_brier_score",
+        "test_avg_confidence",
+        "test_confidence_correct",
+        "test_confidence_incorrect",
+    )
+    for record in records:
+        if _record_task(record) != "classification":
+            continue
+        if all(not _is_missing_metric(record.get(key)) for key in test_keys):
+            continue
+        record.update(_evaluate_checkpoint_on_test(record))
 
 
 def ingest_results(
@@ -644,6 +897,8 @@ def ingest_results(
         rec["run_dir"] = new_run_dir
         records.append(rec)
 
+    backfill_missing_summary_metrics(records)
+    backfill_missing_test_metrics(records)
     out_csv = os.path.join(model_dir, "results.csv")
     out_jsonl = os.path.join(model_dir, "results.jsonl")
     save_results(records, out_csv, out_jsonl)
@@ -652,6 +907,7 @@ def ingest_results(
 def save_results(records: List[Dict[str, object]], out_csv: str, out_jsonl: str) -> None:
     if not records:
         return
+    sanitized_records = [_sanitize_record(rec) for rec in records]
     preferred_order = [
         "trial_id",
         "run_name",
@@ -706,6 +962,8 @@ def save_results(records: List[Dict[str, object]], out_csv: str, out_jsonl: str)
         "num_parameters",
         "test_accuracy",
         "test_ece",
+        "test_rmse",
+        "test_r2",
         "test_f1_score",
         "test_precision",
         "test_recall",
@@ -715,25 +973,35 @@ def save_results(records: List[Dict[str, object]], out_csv: str, out_jsonl: str)
         "test_confidence_incorrect",
     ]
     field_set = set()
-    for rec in records:
+    for rec in sanitized_records:
         field_set.update(rec.keys())
     fieldnames = [f for f in preferred_order if f in field_set] + [
         f for f in sorted(field_set) if f not in preferred_order
     ]
     os.makedirs(os.path.dirname(out_csv), exist_ok=True)
-    with open(out_csv, "w", encoding="utf-8") as f:
-        f.write(",".join(fieldnames) + "\n")
-        for rec in records:
-            row = []
+    with open(out_csv, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for rec in sanitized_records:
+            row: Dict[str, object] = {}
             for name in fieldnames:
                 value = rec.get(name)
                 if isinstance(value, list):
                     value = "|".join(str(v) for v in value)
-                row.append(str(value))
-            f.write(",".join(row) + "\n")
+                row[name] = value
+            writer.writerow(row)
     with open(out_jsonl, "w", encoding="utf-8") as f:
-        for rec in records:
+        for rec in sanitized_records:
             f.write(json.dumps(rec) + "\n")
+
+
+def snapshot_results(records: List[Dict[str, object]], model_dir: str, run_stamp: str) -> Tuple[str, str]:
+    snapshots_dir = os.path.join(model_dir, "history")
+    os.makedirs(snapshots_dir, exist_ok=True)
+    snapshot_csv = os.path.join(snapshots_dir, f"results_{run_stamp}.csv")
+    snapshot_jsonl = os.path.join(snapshots_dir, f"results_{run_stamp}.jsonl")
+    save_results(records, snapshot_csv, snapshot_jsonl)
+    return snapshot_csv, snapshot_jsonl
 
 
 def main() -> None:
@@ -780,6 +1048,12 @@ def main() -> None:
     parser.add_argument("--log-dir", type=str, default="results/logs")
     parser.add_argument("--wandb-project", type=str, default=None)
     parser.add_argument("--results-dir", type=str, default="results/hyperparameter_tuning")
+    parser.add_argument(
+        "--run-tag",
+        type=str,
+        default=None,
+        help="Optional label for this tuning rerun. Defaults to a timestamped tag.",
+    )
     parser.add_argument(
         "--ingest-from",
         type=str,
@@ -849,6 +1123,8 @@ def main() -> None:
     }
 
     records: List[Dict[str, object]] = []
+    trial_map: Dict[int, TrialConfig] = {}
+    run_stamp = args.run_tag or datetime.now().strftime("%Y%m%d_%H%M%S")
 
     if args.method == "grid":
         configs = grid_configs(model_key, base)
@@ -941,9 +1217,16 @@ def main() -> None:
             )
             best.update(test_metrics)
 
+    if args.task == "classification":
+        backfill_missing_summary_metrics(records)
+        backfill_missing_test_metrics(records)
+
     out_csv = os.path.join(model_dir, "results.csv")
     out_jsonl = os.path.join(model_dir, "results.jsonl")
     save_results(records, out_csv, out_jsonl)
+    snapshot_csv = ""
+    if records:
+        snapshot_csv, _ = snapshot_results(records, model_dir, run_stamp)
 
     if records:
         best = min(records, key=lambda r: float(r["best_val_loss"]))
@@ -951,6 +1234,7 @@ def main() -> None:
         for key, val in best.items():
             print(f"  {key}: {val}")
         print(f"Saved results to: {out_csv}")
+        print(f"Saved fresh snapshot to: {snapshot_csv}")
 
 
 if __name__ == "__main__":

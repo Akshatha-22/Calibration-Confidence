@@ -16,6 +16,7 @@ class FinSenDataset(Dataset):
         texts,
         labels,
         vectorizer: Optional[TfidfVectorizer] = None,
+        label_map: Optional[dict] = None,
         max_features: int = 2000,
     ):
         # If a vectorizer is not provided, we fit a TF-IDF vectorizer on the texts.
@@ -26,13 +27,18 @@ class FinSenDataset(Dataset):
             self.vectorizer = vectorizer
             self.features = self.vectorizer.transform(texts).toarray()
 
-        # Map labels to integers if they are not already numeric
-        if labels.dtype == object or labels.dtype == str:
-            self.label_map = {label: idx for idx, label in enumerate(sorted(labels.unique()))}
-            self.labels = labels.map(self.label_map).values
+        self.label_map = label_map
+        if self.label_map is not None:
+            encoded = labels.map(self.label_map)
+            if encoded.isna().any():
+                missing = sorted(set(labels[encoded.isna()].astype(str)))
+                raise ValueError(f"Found labels missing from label_map: {missing}")
+            self.labels = encoded.astype("int64").to_numpy()
+        elif pd.api.types.is_numeric_dtype(labels):
+            self.labels = labels.astype("int64").to_numpy()
         else:
-            self.label_map = None
-            self.labels = labels.values
+            self.label_map = {label: idx for idx, label in enumerate(sorted(labels.astype(str).unique()))}
+            self.labels = labels.astype(str).map(self.label_map).astype("int64").to_numpy()
 
     def __len__(self):
         return len(self.labels)
@@ -51,6 +57,7 @@ class SequenceFinSenDataset(Dataset):
         texts,
         labels,
         vocab=None,
+        label_map: Optional[dict] = None,
         max_seq_len=128,
         min_freq=2,
         unk_token='<UNK>',
@@ -71,13 +78,18 @@ class SequenceFinSenDataset(Dataset):
         ]
         self.sequences = self._pad_sequences(self.sequences, max_len=self.max_seq_len)
 
-        # Map labels to integers if they are not already numeric
-        if labels.dtype == object or labels.dtype == str:
-            self.label_map = {label: idx for idx, label in enumerate(sorted(labels.unique()))}
-            self.labels = labels.map(self.label_map).values
+        self.label_map = label_map
+        if self.label_map is not None:
+            encoded = labels.map(self.label_map)
+            if encoded.isna().any():
+                missing = sorted(set(labels[encoded.isna()].astype(str)))
+                raise ValueError(f"Found labels missing from label_map: {missing}")
+            self.labels = encoded.astype("int64").to_numpy()
+        elif pd.api.types.is_numeric_dtype(labels):
+            self.labels = labels.astype("int64").to_numpy()
         else:
-            self.label_map = None
-            self.labels = labels.values
+            self.label_map = {label: idx for idx, label in enumerate(sorted(labels.astype(str).unique()))}
+            self.labels = labels.astype(str).map(self.label_map).astype("int64").to_numpy()
 
     def _build_vocab(self, texts, min_freq=2):
         token_counts = {}
@@ -151,9 +163,10 @@ def _build_dataloaders(
     # Fit vectorizer on training data only
     train_dataset = FinSenDataset(train_texts, train_labels, vectorizer=None, max_features=max_features)
     vectorizer = train_dataset.vectorizer
+    label_map = train_dataset.label_map
 
-    val_dataset = FinSenDataset(val_texts, val_labels, vectorizer=vectorizer)
-    test_dataset = FinSenDataset(test_texts, test_labels, vectorizer=vectorizer)
+    val_dataset = FinSenDataset(val_texts, val_labels, vectorizer=vectorizer, label_map=label_map)
+    test_dataset = FinSenDataset(test_texts, test_labels, vectorizer=vectorizer, label_map=label_map)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
@@ -214,11 +227,13 @@ def get_rnn_loaders(
         min_freq=min_freq,
     )
     vocab = train_dataset.vocab
+    label_map = train_dataset.label_map
 
     val_dataset = SequenceFinSenDataset(
         val_texts,
         val_labels,
         vocab=vocab,
+        label_map=label_map,
         max_seq_len=max_seq_len,
     )
 
@@ -226,6 +241,7 @@ def get_rnn_loaders(
         test_texts,
         test_labels,
         vocab=vocab,
+        label_map=label_map,
         max_seq_len=max_seq_len,
     )
 

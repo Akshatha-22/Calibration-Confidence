@@ -137,46 +137,74 @@ def _logits_to_probs(logits: np.ndarray) -> np.ndarray:
     return exp_logits / np.sum(exp_logits, axis=1, keepdims=True)
 
 
-def _binary_metrics_from_probs(
+def _classification_metrics_from_probs(
     probs: np.ndarray, labels: np.ndarray
 ) -> Dict[str, float]:
-    """Compute binary classification metrics from probs and labels."""
+    """Compute classification metrics for binary or multi-class predictions."""
     labels = labels.astype(int).reshape(-1)
-    probs_pos = probs[:, 1]
-    preds = (probs_pos >= 0.5).astype(int)
-
-    tp = int(((preds == 1) & (labels == 1)).sum())
-    tn = int(((preds == 0) & (labels == 0)).sum())
-    fp = int(((preds == 1) & (labels == 0)).sum())
-    fn = int(((preds == 0) & (labels == 1)).sum())
-
+    preds = np.argmax(probs, axis=1)
     total = len(labels)
-    accuracy = (tp + tn) / total if total > 0 else 0.0
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
 
+    accuracy = float(np.mean(preds == labels)) if total > 0 else 0.0
     confidences = np.max(probs, axis=1)
     correct_mask = preds == labels
     incorrect_mask = ~correct_mask
     avg_confidence = float(np.mean(confidences)) if total > 0 else 0.0
-    conf_correct = float(np.mean(confidences[correct_mask])) if np.any(correct_mask) else float("nan")
+    conf_correct = float(np.mean(confidences[correct_mask])) if np.any(correct_mask) else avg_confidence
     conf_incorrect = (
-        float(np.mean(confidences[incorrect_mask])) if np.any(incorrect_mask) else float("nan")
+        float(np.mean(confidences[incorrect_mask])) if np.any(incorrect_mask) else avg_confidence
     )
 
-    brier = float(np.mean((probs_pos - labels) ** 2)) if total > 0 else 0.0
+    num_classes = probs.shape[1]
+    precisions = []
+    recalls = []
+    f1s = []
+    for class_idx in range(num_classes):
+        tp = int(((preds == class_idx) & (labels == class_idx)).sum())
+        fp = int(((preds == class_idx) & (labels != class_idx)).sum())
+        fn = int(((preds != class_idx) & (labels == class_idx)).sum())
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+        precisions.append(precision)
+        recalls.append(recall)
+        f1s.append(f1)
+
+    one_hot = np.eye(num_classes, dtype=np.float64)[labels]
+    brier = float(np.mean(np.sum((probs - one_hot) ** 2, axis=1))) if total > 0 else 0.0
+    rmse, r2 = _compute_rmse_r2(preds.astype(np.float64), labels.astype(np.float64))
 
     return {
         "accuracy": accuracy,
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
+        "precision": float(np.mean(precisions)) if precisions else 0.0,
+        "recall": float(np.mean(recalls)) if recalls else 0.0,
+        "f1": float(np.mean(f1s)) if f1s else 0.0,
         "brier": brier,
+        "rmse": rmse,
+        "r2": r2,
         "avg_confidence": avg_confidence,
         "confidence_correct": conf_correct,
         "confidence_incorrect": conf_incorrect,
     }
+
+
+def _compute_rmse_r2(preds: np.ndarray, targets: np.ndarray) -> Tuple[float, float]:
+    """Compute RMSE and a finite R2, even when the targets are constant."""
+    preds_arr = np.asarray(preds, dtype=np.float64)
+    targets_arr = np.asarray(targets, dtype=np.float64)
+    if preds_arr.size == 0 or targets_arr.size == 0:
+        return 0.0, 0.0
+
+    squared_error = (preds_arr - targets_arr) ** 2
+    mse = float(np.mean(squared_error)) if squared_error.size > 0 else 0.0
+    rmse = float(np.sqrt(mse)) if np.isfinite(mse) else 0.0
+
+    targets_mean = float(np.mean(targets_arr))
+    ss_res = float(np.sum(squared_error))
+    ss_tot = float(np.sum((targets_arr - targets_mean) ** 2))
+    if not np.isfinite(ss_tot) or ss_tot == 0.0:
+        return rmse, 1.0 if ss_res == 0.0 else 0.0
+    return rmse, float(1.0 - (ss_res / ss_tot))
 
 
 def train_epoch(
@@ -268,12 +296,7 @@ def eval_epoch_regression(
     preds_arr = np.concatenate(all_preds, axis=0)
     targets_arr = np.concatenate(all_targets, axis=0)
     reg_ece = regression_calibration_error(preds_arr, targets_arr, n_bins=n_bins)
-    mse = float(np.mean((preds_arr - targets_arr) ** 2)) if n > 0 else float("nan")
-    rmse = float(np.sqrt(mse)) if np.isfinite(mse) else float("nan")
-    targets_mean = float(np.mean(targets_arr)) if n > 0 else float("nan")
-    ss_res = float(np.sum((preds_arr - targets_arr) ** 2)) if n > 0 else float("nan")
-    ss_tot = float(np.sum((targets_arr - targets_mean) ** 2)) if n > 0 else float("nan")
-    r2 = float("nan") if ss_tot == 0.0 else float(1.0 - (ss_res / ss_tot))
+    rmse, r2 = _compute_rmse_r2(preds_arr, targets_arr)
     return {
         "loss": float(val_loss),
         "ece": float(reg_ece),
@@ -290,7 +313,7 @@ def eval_epoch_classification(
     model_name: str,
     n_bins: int = 10,
 ) -> Dict[str, float]:
-    """Evaluation for binary classification."""
+    """Evaluation for classification."""
     model.eval()
     total_loss_list = []
     all_logits = []
@@ -314,7 +337,7 @@ def eval_epoch_classification(
     logits_arr = np.concatenate(all_logits, axis=0)
     targets_arr = np.concatenate(all_targets, axis=0)
     probs = _logits_to_probs(logits_arr)
-    metrics = _binary_metrics_from_probs(probs, targets_arr)
+    metrics = _classification_metrics_from_probs(probs, targets_arr)
     ece_val = expected_calibration_error(probs, targets_arr, n_bins=n_bins)
     metrics.update({"loss": float(val_loss), "ece": float(ece_val)})
     return metrics
@@ -543,7 +566,12 @@ def train_model(
         val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
         num_features = dataset.values.shape[1]
 
-    output_size = 2 if task == "classification" else None
+    output_size = None
+    if task == "classification":
+        train_labels = getattr(train_loader.dataset, "labels", None)
+        if train_labels is None or len(train_labels) == 0:
+            raise ValueError("Could not infer classification output size from training labels.")
+        output_size = int(len(set(int(label) for label in train_labels)))
 
     if model_name == "deep":
         model = build_deep_mlp(
@@ -685,6 +713,8 @@ def train_model(
             val_loss = val_metrics["loss"]
             reg_ece = val_metrics["ece"]
             val_accuracy = val_metrics["accuracy"]
+            history["val_rmse"].append(val_metrics.get("rmse", float("nan")))
+            history["val_r2"].append(val_metrics.get("r2", float("nan")))
         else:
             val_metrics = eval_epoch_regression(model, val_loader, loss_fn, device)
             val_loss = val_metrics["loss"]

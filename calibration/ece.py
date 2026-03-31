@@ -65,7 +65,8 @@ def regression_calibration_error(
         return float("nan")
     lo, hi = float(np.min(preds)), float(np.max(preds))
     if hi <= lo:
-        return 0.0
+        return float(np.mean(np.abs(preds - targets)))
+    
     bin_edges = np.linspace(lo, hi, n_bins + 1)
     err = 0.0
     for i in range(n_bins):
@@ -78,6 +79,12 @@ def regression_calibration_error(
         mean_pred = np.mean(preds[mask])
         mean_tgt = np.mean(targets[mask])
         err += (n / len(preds)) * abs(mean_pred - mean_tgt)
+    
+    # Normalize by target range to ensure error is typically < 1
+    target_range = float(np.max(targets) - np.min(targets))
+    if target_range > 0:
+        err /= target_range
+        
     return float(err)
 
 

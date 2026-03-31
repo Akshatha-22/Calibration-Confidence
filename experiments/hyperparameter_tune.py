@@ -1029,7 +1029,7 @@ def main() -> None:
     parser.add_argument("--val-ratio", type=float, default=0.2)
     parser.add_argument("--split-seed", type=int, default=42)
     parser.add_argument("--dropout", type=float, default=0.0)
-    parser.add_argument("--task", type=str, default="classification", choices=["classification", "regression"])
+    parser.add_argument("--task", type=str, default="regression", choices=["classification", "regression"])
     parser.add_argument("--train-path", type=str, default="data/finsen/processed/train.csv")
     parser.add_argument("--val-path", type=str, default="data/finsen/processed/val.csv")
     parser.add_argument("--test-path", type=str, default="data/finsen/processed/test.csv")
@@ -1088,17 +1088,17 @@ def main() -> None:
         print(f"Ingested tuning results into: {model_dir}")
         return
 
-    if args.task == "classification":
-        if not (os.path.exists(args.train_path) and os.path.exists(args.val_path) and os.path.exists(args.test_path)):
-            print("Train/val/test splits not found. Creating new 70/15/15 split...")
-            create_splits(
-                input_csv=args.input_csv,
-                output_dir=os.path.dirname(args.train_path),
-                train_size=0.7,
-                val_size=0.15,
-                test_size=0.15,
-                random_state=args.split_seed,
-            )
+    # Create splits for both regression and classification tasks
+    if not (os.path.exists(args.train_path) and os.path.exists(args.val_path) and os.path.exists(args.test_path)):
+        print("Train/val/test splits not found. Creating new 70/15/15 split...")
+        create_splits(
+            input_csv=args.input_csv,
+            output_dir=os.path.dirname(args.train_path),
+            train_size=0.7,
+            val_size=0.15,
+            test_size=0.15,
+            random_state=args.split_seed,
+        )
 
     base = {
         "seq_len": args.seq_len,

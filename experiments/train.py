@@ -27,6 +27,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
 import numpy as np
+from sklearn.preprocessing import StandardScaler
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -69,6 +70,21 @@ def split_dataset(
     train_idx = indices[:train_size]
     val_idx = indices[train_size:]
     return Subset(dataset, train_idx), Subset(dataset, val_idx)
+
+
+class NormalizedSubset(Subset):
+    """Wrapper that normalizes targets using a fitted StandardScaler."""
+    def __init__(self, subset: Subset, scaler: StandardScaler):
+        super().__init__(subset.dataset, subset.indices)
+        self.scaler = scaler
+    
+    def __getitem__(self, idx):
+        seq, target = super().__getitem__(idx)
+        # Normalize the target
+        target_normalized = torch.from_numpy(
+            self.scaler.transform(np.array([[float(target.item() if hasattr(target, 'item') else target)]]))
+        ).float().squeeze()
+        return seq, target_normalized
 
 
 def _classification_accuracy_counts(
@@ -231,6 +247,10 @@ def train_epoch(
 
         optimizer.zero_grad()
         loss.backward()
+        
+        # Apply gradient clipping for RNNs to prevent exploding gradients
+        if model_name.lower() in ("rnn", "lstm", "vanilla_rnn"):
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
         # Aggregate global gradient norm across all parameters for this batch.
         total_sq = []
@@ -273,8 +293,13 @@ def eval_epoch_regression(
     loss_fn: nn.Module,
     device: torch.device,
     n_bins: int = 10,
+    scaler: StandardScaler | None = None,
 ) -> Dict[str, float]:
-    """Evaluation for regression tasks."""
+    """Evaluation for regression tasks.
+    
+    If scaler is provided, inverse transforms predictions and targets
+    before computing metrics.
+    """
     model.eval()
     total_loss_list = []
     all_preds = []
@@ -295,11 +320,27 @@ def eval_epoch_regression(
     val_loss = total_loss / max(n, 1)
     preds_arr = np.concatenate(all_preds, axis=0)
     targets_arr = np.concatenate(all_targets, axis=0)
-    reg_ece = regression_calibration_error(preds_arr, targets_arr, n_bins=n_bins)
-    rmse, r2 = _compute_rmse_r2(preds_arr, targets_arr)
+    
+    # Inverse transform if scaler is provided
+    if scaler is not None:
+        # Use (N, F) shape for inverse_transform
+        preds_inv = scaler.inverse_transform(preds_arr)
+        targets_inv = scaler.inverse_transform(targets_arr)
+    else:
+        preds_inv = preds_arr
+        targets_inv = targets_arr
+    
+    # Flatten for global metrics or keep per-feature?
+    # Usually ECE/RMSE are reported as means over all target features
+    # For consistent R2 calculation, we flatten to (N*F,)
+    preds_inv_flat = preds_inv.ravel()
+    targets_inv_flat = targets_inv.ravel()
+    
+    reg_ece = regression_calibration_error(preds_inv_flat, targets_inv_flat, n_bins=n_bins)
+    rmse, r2 = _compute_rmse_r2(preds_inv_flat, targets_inv_flat)
     return {
         "loss": float(val_loss),
-        "ece": float(reg_ece),
+        "calibration_error": float(reg_ece),
         "rmse": rmse,
         "r2": r2,
     }
@@ -349,6 +390,7 @@ def collect_results(
     device: torch.device,
     save_path: str | None = None,
     history: Dict[str, List[float]] | None = None,
+    scaler: StandardScaler | None = None,
 ) -> Dict[str, np.ndarray]:
     """Run model on a dataloader and collect predictions/targets.
 
@@ -371,24 +413,13 @@ def collect_results(
     preds_arr = np.concatenate(all_preds, axis=0)
     targets_arr = np.concatenate(all_targets, axis=0)
 
-    # Align shapes: flatten to (N,) or keep (N, F) for per-example loss
-    if preds_arr.ndim > 1 and preds_arr.shape[-1] == 1:
-        preds_flat = np.squeeze(preds_arr)
-    else:
-        preds_flat = preds_arr
-    if targets_arr.ndim > 1 and targets_arr.shape[-1] == 1:
-        targets_flat = np.squeeze(targets_arr)
-    else:
-        targets_flat = targets_arr
-    if preds_flat.ndim == 1:
-        preds_flat = preds_flat.reshape(-1, 1)
-    if targets_flat.ndim == 1:
-        targets_flat = targets_flat.reshape(-1, 1)
+    # Inverse transform predictions and targets if a scaler is provided
+    if scaler is not None:
+        preds_arr = scaler.inverse_transform(preds_arr)
+        targets_arr = scaler.inverse_transform(targets_arr)
+    
     # Ensure same shape for elementwise loss
-    if preds_flat.shape != targets_flat.shape:
-        preds_flat = preds_arr.reshape(preds_arr.shape[0], -1)
-        targets_flat = targets_arr.reshape(targets_arr.shape[0], -1)
-    per_example_sq = (preds_flat - targets_flat) ** 2
+    per_example_sq = (preds_arr - targets_arr) ** 2
     per_example_loss = np.mean(per_example_sq, axis=-1)
     if not np.isfinite(per_example_loss).all():
         per_example_loss = np.nan_to_num(per_example_loss, nan=0.0, posinf=0.0, neginf=0.0)
@@ -398,6 +429,13 @@ def collect_results(
         "targets": targets_arr,
         "per_example_loss": per_example_loss,
     }
+    
+    # For regression, calculate calibration error on inverse-transformed data (already in preds_arr/targets_arr if scaler provided)
+    if scaler is not None:
+        from calibration.ece import regression_calibration_error
+        # We use a default n_bins=10 here for the final summary
+        cal_err = regression_calibration_error(preds_arr, targets_arr, n_bins=10)
+        results["calibration_error"] = np.asarray([cal_err], dtype=np.float32)
 
     # If outputs look like multi-class logits, compute calibration stats.
     if preds_arr.ndim == 2 and preds_arr.shape[1] > 1:
@@ -469,12 +507,19 @@ def collect_classification_results(
     confidences = np.max(probs, axis=1)
     pred_labels = np.argmax(probs, axis=1)
 
+    rmse, r2 = _compute_rmse_r2(pred_labels.astype(np.float64), targets_arr.astype(np.float64))
+    
+    ece_val = expected_calibration_error(probs, targets_arr.reshape(-1).astype(int), n_bins=10)
+    
     results: Dict[str, np.ndarray] = {
         "logits": logits_arr,
         "probs": probs,
         "confidences": confidences,
         "pred_labels": pred_labels,
         "targets": targets_arr,
+        "rmse": np.asarray([rmse], dtype=np.float32),
+        "r2": np.asarray([r2], dtype=np.float32),
+        "calibration_error": np.asarray([ece_val], dtype=np.float32),
     }
 
     if save_path is not None:
@@ -537,6 +582,7 @@ def train_model(
     val_loader: DataLoader
     test_loader: DataLoader | None = None
     num_features: int
+    target_scaler: StandardScaler | None = None  # For regression tasks only
 
     if task == "classification":
         if model_name in ("rnn", "lstm"):
@@ -560,10 +606,27 @@ def train_model(
             sample_batch = next(iter(train_loader))[0]
             num_features = int(sample_batch.shape[-1])
     else:
+        # REGRESSION TASK: Load FinSen data
         dataset = FinSenDataset(data_path=data_path, seq_length=seq_len)
         train_ds, val_ds = split_dataset(dataset, val_ratio=val_ratio, seed=split_seed)
-        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+        
+        print(f"Dataset loaded: {len(dataset)} total samples")
+        print(f"  Train: {len(train_ds)} samples")
+        print(f"  Val: {len(val_ds)} samples")
+        
+        # Create and fit scaler on TRAINING targets only
+        train_targets = np.array([dataset[idx][1].numpy() for idx in train_ds.indices])
+        target_scaler = StandardScaler()
+        # Fit independently per feature (N, F)
+        target_scaler.fit(train_targets)
+        print(f"Target scaler: fitted on {train_targets.shape[1]} features")
+        
+        # Wrap datasets with normalization
+        train_ds_normalized = NormalizedSubset(train_ds, target_scaler)
+        val_ds_normalized = NormalizedSubset(val_ds, target_scaler)
+        
+        train_loader = DataLoader(train_ds_normalized, batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(val_ds_normalized, batch_size=batch_size, shuffle=False)
         num_features = dataset.values.shape[1]
 
     output_size = None
@@ -620,6 +683,15 @@ def train_model(
 
     loss_fn = nn.CrossEntropyLoss() if task == "classification" else nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
+    
+    # Enable gradient clipping for RNNs to prevent exploding gradients
+    if model_name.lower() in ("rnn", "lstm", "vanilla_rnn"):
+        print(f"Gradient clipping enabled for {model_name.upper()} (max_norm=1.0)")
+        # Stabilize recurrent training as requested
+        if lr > 1e-4:
+            print(f"Reducing learning rate from {lr} to 1e-4 for {model_name.upper()} stability")
+            lr = 1e-4
+            optimizer = optim.Adam(model.parameters(), lr=lr)
 
     history: Dict[str, List[float]] = {
         "train_loss": [],
@@ -716,9 +788,9 @@ def train_model(
             history["val_rmse"].append(val_metrics.get("rmse", float("nan")))
             history["val_r2"].append(val_metrics.get("r2", float("nan")))
         else:
-            val_metrics = eval_epoch_regression(model, val_loader, loss_fn, device)
+            val_metrics = eval_epoch_regression(model, val_loader, loss_fn, device, scaler=target_scaler)
             val_loss = val_metrics["loss"]
-            reg_ece = val_metrics["ece"]
+            reg_ece = val_metrics["calibration_error"]
             val_accuracy = None
             history["val_rmse"].append(val_metrics.get("rmse", float("nan")))
             history["val_r2"].append(val_metrics.get("r2", float("nan")))
@@ -743,7 +815,8 @@ def train_model(
                 history["val_r2"].append(float("nan"))
         current_lr = float(optimizer.param_groups[0].get("lr", lr))
         history["learning_rate"].append(current_lr)
-        msg = f"Epoch {epoch:3d} | train_loss={train_loss:.6f} | val_loss={val_loss:.6f} | ECE={reg_ece:.4f}"
+        ece_label = "ECE" if task == "classification" else "cal_err"
+        msg = f"Epoch {epoch:3d} | train_loss={train_loss:.6f} | val_loss={val_loss:.6f} | {ece_label}={reg_ece:.4f}"
         if task == "classification":
             msg += f" | acc={val_accuracy:.3f}"
         print(msg)
@@ -820,6 +893,7 @@ def train_model(
                 device=device,
                 save_path=results_path,
                 history=history,
+                scaler=target_scaler,
             )
 
     return model, history

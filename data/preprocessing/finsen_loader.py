@@ -19,10 +19,8 @@ class FinSenDataset(Dataset):
     ):
         """Load and merge FinSen CSV files into a sequence dataset.
 
-        If numeric columns are missing, the loader will vectorize the
-        available text columns with TF-IDF so the models still receive
-        numeric tensors.  It still prefers actual numeric columns when
-        they exist (e.g., from the processed folder).
+        For regression, vectorizes text to TF-IDF and combines with any numeric features.
+        For adequate feature dimension, always includes vectorized text features.
         """
         self.seq_length = seq_length
         self.text_vectorizer_max_features = text_vectorizer_max_features
@@ -31,31 +29,31 @@ class FinSenDataset(Dataset):
         print(f"Merged data: {self.data.shape[0]} rows, {self.data.shape[1]} columns")
 
         numeric_df = self.data.select_dtypes(include=[np.number])
-        if numeric_df.shape[1] == 0:
-            # Try to fall back to processed data if available.
-            if os.path.basename(os.path.normpath(data_path)) == 'raw':
-                processed_path = os.path.join(os.path.dirname(data_path), 'processed')
-                if os.path.isdir(processed_path):
-                    print(
-                        "No numeric columns found in raw CSVs; "
-                        f"trying processed folder: {processed_path}"
-                    )
-                    self.data = self._load_and_merge_csvs(processed_path)
-                    numeric_df = self.data.select_dtypes(include=[np.number])
-            if numeric_df.shape[1] == 0:
-                numeric_df = self._vectorize_text_columns(self.data)
-
-        if numeric_df.shape[1] == 0:
+        
+        # Always vectorize text to have enough features for regression
+        text_df = self._vectorize_text_columns(self.data)
+        
+        # Combine numeric and text features
+        if text_df is not None and len(text_df) > 0:
+            if len(numeric_df) > 0:
+                # Add content_length or other numeric features
+                numeric_df_subset = numeric_df[[col for col in numeric_df.columns if col not in ['Title', 'Tag', 'Content', 'Category']]]
+                if len(numeric_df_subset.columns) > 0:
+                    combined_df = pd.concat([text_df, numeric_df_subset], axis=1)
+                else:
+                    combined_df = text_df
+            else:
+                combined_df = text_df
+        elif len(numeric_df) > 0:
+            combined_df = numeric_df
+        else:
             raise ValueError(
-                "No numeric columns could be derived from the merged dataset. "
-                "Ensure the CSV files contain numeric features or text that "
-                "can be vectorized."
+                "Could not create any numeric features from the dataset. "
+                "Ensure the CSV files contain numeric features or text that can be vectorized."
             )
 
-        self.values = numeric_df.astype(np.float32).values
-        if numeric_df.shape[1] != self.data.shape[1]:
-            dropped = set(self.data.columns) - set(numeric_df.columns)
-            print(f"Dropped non-numeric columns: {sorted(dropped)}")
+        self.values = combined_df.astype(np.float32).values
+        print(f"Final feature dimension: {self.values.shape[1]}")
 
     def _load_and_merge_csvs(self, data_path: str) -> pd.DataFrame:
         """Load all CSV files in a folder and merge them (on 'date' if present)."""

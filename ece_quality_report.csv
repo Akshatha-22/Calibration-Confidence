@@ -1,0 +1,6 @@
+model,status,ece_max,ece_mean,issue
+deep_mlp,✅ VALID,0.0403737830757582,0.012044281310245925,None detected
+lstm,❌ INVALID,483.46305807013255,372.62636116094757,Extreme values suggest logits used instead of probabilities OR training divergence
+mlp,✅ VALID,0.1665098403528524,0.02400741260378842,None detected
+residual_mlp,⚠️  SUSPICIOUS,125.01603096409846,57.678103388401496,ECE values appear scaled (possibly ×50-100)
+vanilla_rnn,❌ INVALID,483.7058635510897,347.977820940185,Extreme values suggest logits used instead of probabilities OR training divergence

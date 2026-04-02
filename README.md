@@ -1,95 +1,114 @@
-# Calibration-Failure-Detection
-This is an 8th semester project.
-# 📊 AI Confidence Calibration Failure Detection in Financial Time Series
+# 📊 AI Confidence Calibration Failure Detection
+
+**8th Semester Project** | Analyzing confidence calibration in neural networks for financial forecasting
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-red.svg)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Kaggle](https://img.shields.io/badge/Dataset-FinSen-green.svg)](https://github.com/EagleAdelaide/FinSen_Dataset)
 
-## 🎯 Overview
+## 🎯 What is This Project?
 
-This repository contains the official implementation for **AI Confidence Calibration Failure Detection**, a systematic study of how five different neural architectures behave in terms of confidence calibration when applied to financial time series forecasting.
+This project studies **how well neural networks are calibrated** when predicting financial time series. A well-calibrated model is correct 80% of the time when it says 80% confidence. But most modern models are overconfident, which is dangerous in finance.
 
-Well-calibrated models should be correct approximately 80% of the time when they report 80% confidence. However, modern deep learning models often exhibit **overconfidence** or **underconfidence**, leading to dangerous decisions in high-stakes applications like algorithmic trading and risk management.
+We test **5 different neural network architectures** on the same data and measure which ones fail first and which have the most stable confidence.
 
-## 🔍 What We Study
+## 🔬 The 5 Models We Compare
 
-We compare **five architectures** on the same financial time series data:
+| Model | Type | Purpose |
+|-------|------|---------|
+| **MLP** | Feedforward | Simple baseline (no memory) |
+| **Deep MLP** | Feedforward | Test if depth affects calibration |
+| **Vanilla RNN** | Recurrent | Simple recurrence with clear gradient flow |
+| **LSTM** | Gated Recurrent | Industry standard with gates |
+| **Residual MLP** | Hybrid | Feedforward + skip connections |
 
-| Model | Type | Why It's Included |
-|-------|------|-------------------|
-| **MLP** | (Sliding Window) | Feedforward | Baseline with no temporal memory |
-| **Deep MLP** | Feedforward | Tests if depth affects calibration |
-| **Vanilla RNN** | Recurrent | Simple recurrent baseline, clear gradient dynamics |
-| **LSTM** | Gated Recurrent | Industry standard, masks gradient issues |
-| **Residual MLP** | Hybrid | Skip connections for sequence modeling |
+## 📊 Key Metrics
 
-## 📈 Key Research Questions
-
-1. **How does calibration error (ECE) evolve over time** for each architecture?
-2. **Which models fail earliest** and which fail most predictably?
-3. **Can gradient norms predict impending calibration failure**?
-4. **Do different architectures have different "failure signatures"**?
-
-## Why These Choices
-
-**Why 70/15/15 splits?**  
-We use 70% train / 15% validation / 15% test to balance learning capacity with robust evaluation. The validation set is large enough for stable early-stopping and model selection, while the test set remains sizable for reliable final reporting.
-
-**Why a hold-out test set?**  
-The test set is never used during training or hyperparameter tuning. It provides an unbiased estimate of real-world performance after all decisions are finalized.
-
-**Why these metrics (ECE, Brier, confidence stats)?**  
-Accuracy alone can hide calibration failures.  
-ECE measures the gap between confidence and correctness.  
-Brier score captures probabilistic quality (lower is better).  
-Average confidence and confidence on correct/incorrect predictions show whether the model is over-confident or under-confident in practice.
-
-**Why these model families?**  
-We compare five architectures to cover distinct inductive biases:  
-MLP: a simple baseline with no temporal memory.  
-Deep MLP: tests the effect of depth on calibration.  
-Vanilla RNN: simple recurrence with clear gradient behavior.  
-LSTM: gated recurrence to handle longer dependencies.  
-Residual MLP: skip connections to stabilize deeper feedforward models.
+- **ECE (Expected Calibration Error)**: Gap between predicted confidence and actual correctness
+- **Brier Score**: Overall prediction quality (lower is better)
+- **Confidence Stats**: Average confidence on correct vs incorrect predictions
 
 ## 💾 Dataset: FinSen
 
-We use the **FinSen dataset**, which integrates:
-- 📰 Economic/financial news from **197 countries** (2007-2023)
-- 📊 S&P 500 stock market data
-- 🧠 Sentiment scores from FinBERT model
-- 📈 Volatility and price movement targets
+Uses the **FinSen dataset** covering:
+- Financial news from 197 countries (2007-2023)
+- S&P 500 stock prices
+- Sentiment analysis via FinBERT
+- Price movement targets
 
-> *Why FinSen?* The original FinSen paper specifically addresses model calibration using **Expected Calibration Error (ECE)** and achieves **3.34% ECE** with Focal Calibration Loss – making it the perfect benchmark for our study.
+## 📂 Project Structure
 
-## 🏗️ Project Structure
-├── data/
-│ ├── finsen/ # FinSen dataset
-│ └── preprocessing/ # Data loaders for all 5 models
-├── models/
-│ ├── mlp.py # MLP with sliding window
-│ ├── deep_mlp.py # Deep MLP (4-5 layers)
-│ ├── vanilla_rnn.py # Simple RNN
-│ ├── lstm.py # LSTM with gates
-│ └── residual_mlp.py # MLP with skip connections
+```
+./
 ├── calibration/
-│ ├── ece.py # Expected Calibration Error
-│ ├── reliability.py # Reliability diagrams
-│ └── gradient_hooks.py # Gradient tracking
+│   ├── ece.py                          # Expected Calibration Error computation
+│   ├── confidence_tracking.py           # Confidence tracking utilities
+│   ├── gradient_hooks.py                # Gradient monitoring hooks
+│   └── reliability.py                   # Reliability diagram generation
+├── checkpoints_deep_mlp/                # Pre-trained Deep MLP weights
+├── checkpoints_mlp/                     # Pre-trained MLP weights
+├── checkpoints_vanilla_rnn/             # Pre-trained RNN weights
+├── data/finsen/
+│   ├── processed/
+│   │   ├── train.csv
+│   │   ├── val.csv
+│   │   └── test.csv
+│   └── raw/
+│       └── FinSen_US.csv
 ├── experiments/
-│ ├── train.py # Unified training loop
-│ ├── hyperparameter_tune.py # Grid search
-│ └── robustness_tests.py # Noise, missing data
+│   ├── train.py                         # Main training script
+│   ├── hyperparameter_tune.py           # Hyperparameter tuning script
+│   ├── plot_ece_over_time.py            # ECE evolution plots
+│   ├── plot_sensitivity.py              # Sensitivity analysis
+│   ├── robustness_tests.py              # Robustness testing
+│   └── inspect_results.py               # Results inspection utilities
+├── models/
+│   ├── mlp.py                           # MLP architecture
+│   ├── deep_mlp.py                      # Deep MLP architecture
+│   ├── vanilla_rnn.py                   # Vanilla RNN architecture
+│   ├── lstm.py                          # LSTM architecture
+│   └── residual_mlp.py                  # Residual MLP architecture
+├── preprocessing/
+│   ├── finsen_loader.py                 # FinSen dataset loader
+│   ├── mlp_loader.py                    # MLP data loader
+│   ├── rnn_loader.py                    # RNN data loader
+│   └── data_loaders.py                  # Generic data loaders
 ├── results/
-│ ├── figures/ # ECE plots, gradient norms
-│ └── tables/ # Comparative results
+│   ├── figures/
+│   │   ├── all_models_loss.png
+│   │   ├── ece_over_time.png
+│   │   ├── gradient_norms.png
+│   │   ├── model_performance_comparison.png
+│   │   └── ... (more plots)
+│   ├── sensitivity_plots/
+│   │   ├── mlp.png
+│   │   ├── deep_mlp.png
+│   │   ├── lstm.png
+│   │   ├── vanilla_rnn.png
+│   │   └── residual_mlp.png
+│   └── hyperparameter_tuning/
+│       ├── mlp/
+│       ├── lstm/
+│       ├── deep_mlp/
+│       └── ... (tuning results)
 ├── notebooks/
-│ └── analysis.ipynb # Visualization and stats
+│   ├── model_tuning.ipynb
+│   ├── results_report.ipynb
+│   └── colab_train_and_report.ipynb
+├── models.py                            # Model utilities
+├── model_summary.csv                    # Summary of model metrics
+├── ece_quality_report.csv               # ECE quality report
 ├── requirements.txt
 ├── setup.py
-└── README.md
+└── TRAINING_PIPELINE_FIXES.md
+```
+## 🛠️ Main Components
+
+- **calibration/** - ECE computation, gradient hooks, reliability diagrams
+- **models/** - 5 neural network architectures for comparison
+- **experiments/train.py** - Main training script with all fixes applied
+- **data/finsen/** - FinSen dataset with train/val/test splits
+- **results/** - Output directory for trained models and metrics
 
 ## 🚀 Getting Started
 ### Prerequisites

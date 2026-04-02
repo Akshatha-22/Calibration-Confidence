@@ -35,6 +35,7 @@ Uses the **FinSen dataset** covering:
 - S&P 500 stock prices
 - Sentiment analysis via FinBERT
 - Price movement targets
+- https://github.com/EagleAdelaide/FinSen_Dataset
 
 ## 📂 Project Structure
 

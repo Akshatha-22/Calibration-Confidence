@@ -150,7 +150,4 @@ class LSTM(nn.Module):
         """
         h0 = torch.zeros(self.num_layers, batch_size, self.hidden_size).to(device)
         c0 = torch.zeros(self.num_layers, batch_size, self.hidden_size).to(device)
-        return (h0, c0)</content>
-</xai:function_call name="replace_string_in_file">
-<parameter name="filePath">d:\Calibration-Confidence\models.py</content>
-<parameter name="filePath">d:\Calibration-Confidence\models.py
+        return (h0, c0)
